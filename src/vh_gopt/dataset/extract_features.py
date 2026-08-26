@@ -256,7 +256,7 @@ def main():
 
     # 2. Nạp Acoustic Model (KoelLabs CTC)
     from transformers import AutoModelForCTC, AutoProcessor
-    print(f"\n[1/2] Nạp Acoustic Model: {args.acoustic-model if hasattr(args, 'acoustic-model') else args.acoustic_model} ...")
+    print(f"\n[1/2] Nạp Acoustic Model: {args.acoustic_model} ...")
     koel_proc = AutoProcessor.from_pretrained(args.acoustic_model)
     koel_model = AutoModelForCTC.from_pretrained(args.acoustic_model).to(args.device).eval()
     blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
