@@ -10,7 +10,13 @@
 #   ./run.sh train    [flags...]        # train GOPT/HIA tren npz trung gian
 set -euo pipefail
 # Giu cwd cua nguoi goi: cac path tuong doi (data/, cache/) tinh theo noi chay.
-PY="${PY:-python3}"
+# Uu tien .venv trong thu muc module, roi .venv thu muc cha (layout monorepo); PY=... de override.
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "${PY:-}" ]; then
+  if [ -x "$ROOT/.venv/bin/python" ]; then PY="$ROOT/.venv/bin/python"
+  elif [ -x "$ROOT/../.venv/bin/python" ]; then PY="$ROOT/../.venv/bin/python"
+  else PY="python3"; fi
+fi
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
