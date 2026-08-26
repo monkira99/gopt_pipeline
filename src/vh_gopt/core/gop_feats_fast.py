@@ -48,6 +48,11 @@ def _ctc_forward_batch_norm_jit(params: torch.Tensor, seqmat: torch.Tensor, blan
 
         curr = (v0 + v1 + v2) * emit_all[:, :, t]
 
+        # Áp dụng điều kiện reachability chuẩn của bản gốc (khớp 100% baseline 0.734)
+        start = max(0, L - 2 * (T - t))
+        if start > 0:
+            curr[:, :start] = 0.0
+
         bar = torch.clamp_min(curr.sum(dim=1), 1e-20)
         alpha_bar[:, t] = bar
         alphas = curr / bar.unsqueeze(1)
