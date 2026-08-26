@@ -107,7 +107,7 @@ class GOPTForScoring(GOPT):
             self.register_buffer("bw_utt", torch.tensor(bw_utt))
 
     def _w(self, label, table):
-        idx = torch.bucketize(label.clamp(0, 2.0), self.bw_edges)   # bin index
+        idx = torch.bucketize(label.clamp(min=0), self.bw_edges)    # bin index (edges span nhãn thật; bucketize tự đẩy điểm cao vào bin cuối)
         return table[idx]
 
     def forward(self, feat, phn, phone_label=None, word_label=None, utt_label=None):
@@ -458,10 +458,11 @@ def main():
 
     bw = {}
     if args.balanced:
+        hi100 = 100.0 if tr.is_scale_100 else 2.0                   # dải điểm thật: 0-100 (gold) hay 0-2 (SO762)
         vphn = tr.phn.numpy() >= 0
-        edges, wphn = effective_number_weights(tr.phone_label.numpy()[vphn], args.bins, args.beta, wcap=args.wcap)
+        edges, wphn = effective_number_weights(tr.phone_label.numpy()[vphn], args.bins, args.beta, hi=hi100, wcap=args.wcap)
         if args.balance_heads == "all":
-            _, wutt = effective_number_weights(tr.utt_label.numpy().reshape(-1), args.bins, args.beta, wcap=args.wcap)
+            _, wutt = effective_number_weights(tr.utt_label.numpy().reshape(-1), args.bins, args.beta, hi=hi100, wcap=args.wcap)
         else:
             wutt = np.ones_like(wphn)                               # plain mean for utt
         bw = dict(balanced=True, bw_edges=edges, bw_phn=wphn, bw_utt=wutt)

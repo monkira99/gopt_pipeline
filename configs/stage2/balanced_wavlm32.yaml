@@ -1,0 +1,62 @@
+# ============================================================================
+# Stage 2: Baseline + SCORE-BALANCED (nhấn đuôi điểm thấp) trên nhãn 0-100
+# Giống baseline_wavlm32 nhưng bật balanced (đã sửa bug clamp(0,2)->0-100).
+# Mục tiêu: cải thiện phone/word PCC + phân biệt kid phát âm kém.
+# ============================================================================
+
+experiment_name: "stage2_balanced_wavlm32"
+
+dataset:
+  hf_dataset: "tiennguyenbnbk/gopt-vh-gold-features"
+  train: "train"
+  val: "val"
+  test: "test_unseen_speakers"
+  test2: "test_unseen_prompts"
+  scale: "0-100"
+
+features:
+  acoustic_model: "KoelLabs/xlsr-english-01"
+  gop_map: "koel"
+  use_occ: false
+  use_prosody: false
+  utt_prosody: true
+  use_wavlm: true
+  wavlm_dim: 32
+  wavlm_fuse: "stack"
+
+model:
+  model: "gopt"
+  arch: "base"
+  embed_dim: 24
+  depth: 3
+  heads: 1
+  dropout: 0.20
+  noise: 0.10
+
+training:
+  epochs: 80
+  bs: 25
+  lr: 0.001
+  wd: 0.0001
+  sched: "cosine"
+  w_phn: 1.0
+  w_word: 1.0
+  w_utt: 1.0
+  best_metric: "mean"
+  early_stop_patience: 12
+  early_stop_threshold: 0.0
+  seed: 0
+  # --- score-balanced weighting (Do et al. 2023) ---
+  balanced: true
+  bins: 10               # 0-100 chia 10 bin rộng 10 điểm
+  beta: 0.999
+  balance_heads: "all"   # cân cả phone/word (bw_phn) lẫn utt (bw_utt)
+  wcap: 5.0              # chặn trọng số bin thưa <= 5x
+
+logging:
+  out: "ckpt/stage2_balanced_wavlm32"
+  wandb_project: "gopt-vh-experiments"
+  wandb_run: "stage2-balanced-wavlm32"
+  no_wandb: false
+  push_model: true
+  hf_repo: "tiennguyenbnbk/gopt-vh-balanced-wavlm32"
