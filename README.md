@@ -28,15 +28,19 @@ gopt_pipeline/
 ## Luong chuan
 
 ```
-(may du lieu)  ./run.sh snapshot --push-repo <org>/gopt-vh-corpus
-                     │  (raw manifest + vendor json + audio ~4.5 GB)
-(server build) ./run.sh fetch --repo <org>/gopt-vh-corpus
-               ./run.sh pack                       # trich GOP 80-d KoelLabs (~1-2s/audio CPU)
-               ./run.sh verify                     # PHAI PASS truoc khi push
-               ./run.sh push --repo <org>/gopt-vh-scripted-gold
-               ./run.sh build --repo <org>/gopt-vh-gold   # GOLD Arrow (audio+labels) -> HF
+(Máy local)    ./run.sh build --repo <org>/gopt-vh-gold   # Đóng gói audio + nhãn -> đẩy HF
+                     │
+                     ▼ (HuggingFace Hub: <org>/gopt-vh-gold)
+                     │
+(Server GPU)   ./run.sh extract --dataset-repo <org>/gopt-vh-gold --device cuda
+                     │ (Trích 100% Feature: KoelLabs 80d + Prosody 8d + WavLM 1024d)
+                     ▼
+               data/gopt_vh_scripted_gold/*.npz (Hoàn chỉnh)
+                     │
+                     ▼
                ./run.sh train --train data/gopt_vh_scripted_gold/train.npz \
-                              --test  data/gopt_vh_scripted_gold/test_unseen_speakers.npz ...
+                              --test  data/gopt_vh_scripted_gold/test_unseen_speakers.npz \
+                              --epochs 80 --use-wavlm --wavlm-fuse stack --wavlm-dim 32 --utt-prosody
 ```
 
 ## Setup server moi

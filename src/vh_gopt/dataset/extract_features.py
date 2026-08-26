@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Trích xuất đầy đủ 100% các nhóm Feature trên GPU cho Baseline GOPT tốt nhất:
+
+Bộ Feature được trích xuất gồm:
+  1. KoelLabs-GOP 80-d (`feat` [N, 150, 80]) + Occupancy (`occ` [N, 150])
+     - Acoustic Model: KoelLabs/xlsr-english-01 (79 IPA classes)
+  2. Prosody 8-d (`dur` [N, 150] + `eng` [N, 150, 7])
+     - CTC Viterbi Forced Alignment + Energy statistics
+  3. WavLM SSL (`wavlm` [N, 150, 1024] fp16)
+     - Model: microsoft/wavlm-large (Layer 12 pooled per-phone segment)
+
+Nguồn dữ liệu đầu vào (linh hoạt):
+  --dataset-repo : Tải trực tiếp từ HuggingFace (mặc định: tiennguyenbnbk/gopt-vh-gold)
+  --dataset-dir  : Hoặc tải từ thư mục local DatasetDict (data/gopt_vh_gold_arrow)
+
+Đầu ra:
+  --out-dir      : Xuất 4 file .npz hoàn chỉnh (train.npz, val.npz, test_*.npz)
+                   sẵn sàng 100% để nạp vào gopt_train.py huấn luyện ngay!
+"""
+import argparse
+import io
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+import torch
+from tqdm import tqdm
+
+from vh_gopt.config import add_config_arg, load_config
+from vh_gopt.core import (
+    PHONE_LIST,
+    detect_blank_id,
+    phone_prosody,
+    phone_segments,
+)
+from vh_gopt.core.gop_feats_fast import extract_utt_feats_norm_fast
+from vh_gopt.core.koel_gop import map_phones_to_ids_koel
+
+SPLITS = ["train", "val", "test_unseen_speakers", "test_unseen_prompts"]
+
+
+def load_input_dataset(args, cfg):
+    from datasets import Audio, load_dataset, load_from_disk
+
+    if args.dataset_dir and os.path.exists(args.dataset_dir):
+        print(f"Nạp dataset từ thư mục local: {args.dataset_dir}")
+        ds = load_from_disk(args.dataset_dir)
+    elif os.path.exists("data/gopt_vh_gold_arrow"):
+        print("Tìm thấy local cache: data/gopt_vh_gold_arrow -> nạp trực tiếp...")
+        ds = load_from_disk("data/gopt_vh_gold_arrow")
+    else:
+        repo = args.dataset_repo or cfg.get("hf_dataset_repo") or "tiennguyenbnbk/gopt-vh-gold"
+        print(f"Tải dataset từ HuggingFace Hub: {repo} ...")
+        ds = load_dataset(repo)
+
+    # Đảm bảo cột audio ở dạng raw bytes (không ép decode qua torchcodec nếu chưa cần)
+    ds = ds.cast_column("audio", Audio(decode=False))
+    return ds
+
+
+def extract_split_features(split_name, ds_split, out_path,
+                           koel_model, koel_processor, blank_id,
+                           wl_model, wl_fe, wl_layer,
+                           device="cuda", limit=0, max_len=150,
+                           use_wavlm=True, use_prosody=True):
+    N = len(ds_split) if limit == 0 else min(limit, len(ds_split))
+    print(f"\n============================================================")
+    print(f"--- TRÍCH XUẤT FEATURE: {split_name} ({N:,} mẫu) -> {out_path} ---")
+    print(f"============================================================")
+
+    # 1. Khởi tạo mảng Feature đầu ra
+    GOP_DIM = 80
+    feat = np.zeros((N, max_len, GOP_DIM), dtype=np.float32)
+    occ = np.zeros((N, max_len), dtype=np.float32)
+    dur = np.zeros((N, max_len), dtype=np.float32)
+    eng = np.zeros((N, max_len, 7), dtype=np.float32)
+    wavlm = np.zeros((N, max_len, 1024), dtype=np.float16)
+
+    # 2. Khởi tạo mảng Nhãn & Metadata (sao chép trực tiếp từ dataset)
+    phn = np.full((N, max_len), -1, dtype=np.int16)
+    phone_label = np.full((N, max_len), -1.0, dtype=np.float32)
+    phone_weight = np.zeros((N, max_len), dtype=np.float32)
+    n_vendors = np.zeros((N, max_len), dtype=np.uint8)
+
+    word_id = np.full((N, max_len), -1, dtype=np.int16)
+    word_acc = np.full((N, max_len), -1.0, dtype=np.float32)
+    word_weight = np.zeros((N, max_len), dtype=np.float32)
+
+    utt_label = np.full((N, 4), -1.0, dtype=np.float32)
+    utt_weight = np.zeros((N, 4), dtype=np.float32)
+    utt_nv = np.zeros((N, 4), dtype=np.uint8)
+
+    msdd_type = np.full((N, max_len), -1, dtype=np.int16)
+    msdd_sub = np.full((N, max_len), -1, dtype=np.int16)
+
+    ids_list = []
+    texts_list = []
+
+    t0 = time.time()
+    for i in tqdm(range(N), desc=f"Extracting {split_name}", unit="utt"):
+        ex = ds_split[i]
+        rid = str(ex["id"])
+        ids_list.append(rid)
+        texts_list.append(str(ex["text"]))
+
+        # Copy nhãn
+        phn[i] = np.array(ex["phn"][:max_len], dtype=np.int16)
+        phone_label[i] = np.array(ex["phone_label"][:max_len], dtype=np.float32)
+        phone_weight[i] = np.array(ex["phone_weight"][:max_len], dtype=np.float32)
+        n_vendors[i] = np.array(ex["n_vendors"][:max_len], dtype=np.uint8)
+
+        word_id[i] = np.array(ex["word_id"][:max_len], dtype=np.int16)
+        word_acc[i] = np.array(ex["word_acc"][:max_len], dtype=np.float32)
+        word_weight[i] = np.array(ex["word_weight"][:max_len], dtype=np.float32)
+
+        utt_label[i] = np.array(ex["utt_label"], dtype=np.float32)
+        utt_weight[i] = np.array(ex["utt_weight"], dtype=np.float32)
+        utt_nv[i] = np.array(ex["utt_nv"], dtype=np.uint8)
+
+        msdd_type[i] = np.array(ex["msdd_type"][:max_len], dtype=np.int16)
+        msdd_sub[i] = np.array(ex["msdd_sub"][:max_len], dtype=np.int16)
+
+        # Lấy danh sách âm vị canonical thực tế (loại bỏ pad -1)
+        valid_phn_ids = [int(p) for p in ex["phn"] if p >= 0][:max_len]
+        phone_list_ref = ex.get("phone_list") or PHONE_LIST
+        canon_phones = [phone_list_ref[pid] for pid in valid_phn_ids]
+        S = len(canon_phones)
+
+        # Đọc audio waveform
+        a_dict = ex["audio"]
+        if a_dict.get("bytes") is not None:
+            wav_data, sr = sf.read(io.BytesIO(a_dict["bytes"]))
+        elif a_dict.get("path") is not None and os.path.exists(a_dict["path"]):
+            wav_data, sr = sf.read(a_dict["path"])
+        else:
+            print(f"[WARN] Không tìm thấy audio cho ID={rid}")
+            continue
+
+        if wav_data.ndim > 1:
+            wav_data = wav_data.mean(axis=1)
+        if sr != 16000:
+            import librosa
+            wav_data = librosa.resample(wav_data, orig_sr=sr, target_sr=16000)
+
+        # Map canonical phones sang KoelLabs token IDs
+        labels_koel, _ = map_phones_to_ids_koel(canon_phones, koel_processor.tokenizer)
+        labels_t = torch.tensor(labels_koel, dtype=torch.long)
+
+        # ---- 1. KOELLABS CTC FORWARD & GOP EXTRACTION ----
+        iv = koel_processor(wav_data, sampling_rate=16000, return_tensors="pt").input_values.to(device)
+        with torch.no_grad():
+            koel_logits = koel_model(iv).logits[0]  # [T, 80]
+
+        post = torch.softmax(koel_logits, dim=-1).cpu().type(torch.float64).T  # [P, T]
+        gop_res, occ_res = extract_utt_feats_norm_fast(post, labels_t, blank=blank_id, occ=True)
+        feat[i, :S] = gop_res.numpy()[:S]
+        if occ_res is not None:
+            occ[i, :S] = occ_res.numpy()[:S]
+
+        # ---- 2. PROSODY (VITERBI FORCED ALIGNMENT + ENERGY) ----
+        logp = koel_logits.log_softmax(-1).cpu().double()  # [T, C]
+        if use_prosody and S > 0:
+            d_res, e_res = phone_prosody(logp, labels_t, wav_data, blank=blank_id)
+            dur[i, :S] = d_res[:S]
+            eng[i, :S] = e_res[:S]
+
+        # ---- 3. WAVLM-LARGE LAYER 12 SSL FEATURE (POOLED PER PHONE) ----
+        if use_wavlm and wl_model is not None and S > 0:
+            segs, T_ctc = phone_segments(logp, labels_t, blank=blank_id)
+            wf = wl_fe(wav_data, sampling_rate=16000, return_tensors="pt").input_values.to(device)
+            with torch.no_grad():
+                wl_out = wl_model(wf, output_hidden_states=True)
+                hs = wl_out.hidden_states[wl_layer].squeeze(0).float().cpu()  # [Tw, 1024]
+            Tw = hs.shape[0]
+            ratio = Tw / max(T_ctc, 1)
+            for k, (a, b) in enumerate(segs):
+                if k >= max_len:
+                    break
+                a2, b2 = int(a * ratio), max(int(b * ratio), int(a * ratio) + 1)
+                wavlm[i, k] = hs[a2:min(b2, Tw)].mean(0).numpy().astype(np.float16)
+
+    # 3. Lưu mảng Tensor hoàn chỉnh ra file .npz
+    out_dir = Path(out_path).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    phone_list_save = np.array(ds_split[0].get("phone_list") or PHONE_LIST, dtype="U8")
+    utt_heads_save = np.array(ds_split[0].get("utt_heads") or ["accuracy", "completeness", "fluency", "total"], dtype="U16")
+    word_heads_save = np.array(ds_split[0].get("word_heads") or ["accuracy"], dtype="U16")
+    scale_save = np.array(ds_split[0].get("scale") or "0-100", dtype="U8")
+
+    save_dict = {
+        "feat": feat,
+        "occ": occ,
+        "dur": dur,
+        "eng": eng,
+        "wavlm": wavlm,
+        "wavlm_layer": np.int64(wl_layer),
+        "phn": phn,
+        "word_id": word_id,
+        "phone_label": phone_label,
+        "phone_weight": phone_weight,
+        "n_vendors": n_vendors,
+        "word_acc": word_acc,
+        "word_weight": word_weight,
+        "utt_label": utt_label,
+        "utt_weight": utt_weight,
+        "utt_nv": utt_nv,
+        "msdd_type": msdd_type,
+        "msdd_sub": msdd_sub,
+        "utt_heads": utt_heads_save,
+        "word_heads": word_heads_save,
+        "phone_list": phone_list_save,
+        "ids": np.array(ids_list, dtype="U32"),
+        "texts": np.array(texts_list, dtype="U512"),
+        "N": np.int64(N),
+        "max_len": np.int64(max_len),
+        "scale": scale_save,
+    }
+
+    np.savez_compressed(out_path, **save_dict)
+    dt = time.time() - t0
+    size_mb = os.path.getsize(out_path) / 1e6
+    print(f">> HOÀN TẤT {split_name}: {N} mẫu | {size_mb:.1f} MB | {dt:.1f}s ({dt/max(N,1):.2f}s/utt) -> {out_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    add_config_arg(ap)
+    ap.add_argument("--dataset-repo", default=None, help="Repo HF (mặc định: tiennguyenbnbk/gopt-vh-gold)")
+    ap.add_argument("--dataset-dir", default=None, help="Hoặc thư mục DatasetDict local")
+    ap.add_argument("--out-dir", default="data/gopt_vh_scripted_gold", help="Thư mục xuất .npz")
+    ap.add_argument("--acoustic-model", default="KoelLabs/xlsr-english-01")
+    ap.add_argument("--wavlm-model", default="microsoft/wavlm-large")
+    ap.add_argument("--wavlm-layer", type=int, default=12)
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    ap.add_argument("--no-wavlm", action="store_true", help="Bỏ qua trích xuất WavLM")
+    ap.add_argument("--no-prosody", action="store_true", help="Bỏ qua trích xuất Prosody")
+    ap.add_argument("--max-len", type=int, default=150)
+    ap.add_argument("--limit", type=int, default=0, help="Giới hạn số mẫu/split để smoke test (0 = tất cả)")
+    ap.add_argument("--splits", default=",".join(SPLITS))
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    splits = [x.strip() for x in args.splits.split(",") if x.strip()]
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Thiết bị tính toán: {args.device}")
+
+    # 1. Nạp Dataset
+    ds = load_input_dataset(args, cfg)
+
+    # 2. Nạp Acoustic Model (KoelLabs CTC)
+    from transformers import AutoModelForCTC, AutoProcessor
+    print(f"\n[1/2] Nạp Acoustic Model: {args.acoustic-model if hasattr(args, 'acoustic-model') else args.acoustic_model} ...")
+    koel_proc = AutoProcessor.from_pretrained(args.acoustic_model)
+    koel_model = AutoModelForCTC.from_pretrained(args.acoustic_model).to(args.device).eval()
+    blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
+
+    # 3. Nạp WavLM Model (nếu bật)
+    wl_model, wl_fe = None, None
+    use_wavlm = not args.no_wavlm
+    if use_wavlm:
+        from transformers import AutoFeatureExtractor, WavLMModel
+        print(f"\n[2/2] Nạp WavLM SSL Model: {args.wavlm_model} (Layer {args.wavlm_layer}) ...")
+        wl_fe = AutoFeatureExtractor.from_pretrained(args.wavlm_model)
+        wl_model = WavLMModel.from_pretrained(args.wavlm_model).to(args.device).eval()
+
+    # 4. Chạy trích xuất từng Split
+    for s in splits:
+        if s not in ds:
+            print(f"[SKIP] Không tìm thấy split '{s}' trong dataset")
+            continue
+        out_file = out_dir / f"{s}.npz"
+        extract_split_features(
+            split_name=s,
+            ds_split=ds[s],
+            out_path=str(out_file),
+            koel_model=koel_model,
+            koel_processor=koel_proc,
+            blank_id=blank_id,
+            wl_model=wl_model,
+            wl_fe=wl_fe,
+            wl_layer=args.wavlm_layer,
+            device=args.device,
+            limit=args.limit,
+            max_len=args.max_len,
+            use_wavlm=use_wavlm,
+            use_prosody=not args.no_prosody,
+        )
+
+    print("\n============================================================")
+    print(f"TRÍCH XUẤT TOÀN BỘ FEATURE HOÀN TẤT! File .npz sẵn sàng tại: {out_dir}")
+    print("Có thể chạy huấn luyện ngay:")
+    print(f"  ./run.sh train --train {out_dir}/train.npz --test {out_dir}/test_unseen_speakers.npz --epochs 80 --use-wavlm --wavlm-fuse stack --wavlm-dim 32 --utt-prosody")
+    print("============================================================")
+
+
+if __name__ == "__main__":
+    main()

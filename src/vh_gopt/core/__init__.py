@@ -1,4 +1,5 @@
 from vh_gopt.core.arpa_infer import ARPA39, detect_blank_id
+from vh_gopt.core.prosody import ENERGY_DIM, PROSODY_DIM, phone_prosody, phone_segments
 from vh_gopt.core.vendors import (
     align_sequence_dp,
     align_words_to_canon,

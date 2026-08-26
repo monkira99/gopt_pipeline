@@ -7,6 +7,7 @@
 #   ./run.sh verify   [flags...]        # cong chat luong truoc khi push
 #   ./run.sh push     [flags...]        # npz -> datasets.DatasetDict -> HF Hub (--dry-run de thu conversion)
 #   ./run.sh build    [flags...]        # npz nhan + audio -> GOLD Arrow (audio+labels, load_dataset duoc); --repo de push
+#   ./run.sh extract  [flags...]        # (server GPU) trich day du Feature: KoelLabs 80-d + Prosody 8-d + WavLM 1024-d -> 4 .npz
 #   ./run.sh train    [flags...]        # train GOPT/HIA tren npz trung gian
 set -euo pipefail
 # Giu cwd cua nguoi goi: cac path tuong doi (data/, cache/) tinh theo noi chay.
@@ -27,6 +28,7 @@ case "$cmd" in
   verify)   "$PY" -m vh_gopt.dataset.verify_dataset "$@" ;;
   push)     "$PY" -m vh_gopt.dataset.push_dataset "$@" ;;
   build)    "$PY" -m vh_gopt.dataset.build_gold_arrow "$@" ;;
+  extract)  "$PY" -m vh_gopt.dataset.extract_features "$@" ;;
   train)    "$PY" -m vh_gopt.training.gopt_train "$@" ;;
   *)
     grep '^#   ' "$0" | sed 's/^# *//'
