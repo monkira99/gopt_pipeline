@@ -287,7 +287,7 @@ def extract_split_features(split_name, ds_split, out_path,
                 sync_cuda(device)
                 t_g0 = time.time()
                 post = torch.softmax(koel_logits.float(), dim=-1).type(torch.float64).T
-                gop_res, occ_res = extract_utt_feats_norm_fast(post, labels_t, blank=blank_id, occ=True)
+                gop_res, occ_res = extract_utt_feats_norm_fast(post, labels_t, blank=blank_id, occ=False)
                 feat[i, :S] = gop_res.numpy()[:S]
                 if occ_res is not None:
                     occ[i, :S] = occ_res.numpy()[:S]

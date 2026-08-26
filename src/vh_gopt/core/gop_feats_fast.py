@@ -103,7 +103,7 @@ def canonical_occupancy(params, labels, blank=0):
     return occ
 
 
-def extract_utt_feats_norm_fast(params, labels, blank=0, occ=True, cap_elems=5e8):
+def extract_utt_feats_norm_fast(params, labels, blank=0, occ=False, cap_elems=5e8):
     """Vectorized high-throughput GOP feature-vector extraction on GPU/CPU.
     cap_elems=5e8 cho phép gom toàn bộ candidate của câu vào 1 pass duy nhất."""
     P, T = params.shape
