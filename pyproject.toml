@@ -18,6 +18,7 @@ dependencies = [
   "datasets",
   "torchcodec",
   "g2p_en",
+  "pyyaml",
 ]
 
 [tool.setuptools.packages.find]
