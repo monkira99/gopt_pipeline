@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""Trích xuất đầy đủ 100% các nhóm Feature trên GPU cho Baseline GOPT tốt nhất (Decoupled High-Throughput Pipeline).
-
-Kiến trúc tách biệt CPU / GPU tối ưu tối đa:
-  1. CPU Background Producer (Multi-worker DataLoader, Pinned Memory):
-     - Giải mã MP3, resample 16kHz, mapping token canonical chạy bất đồng bộ trong background.
-  2. Pure GPU Neural Inference (KoelLabs CTC + Truncated WavLM Layer 12):
-     - Chạy theo Batch (16-32) trên CUDA Tensor Cores ở chế độ FP16 (`torch.inference_mode()`).
-     - Hỗ trợ `torch.compile(mode="reduce-overhead")` (Inductor kernel fusion).
-  3. Vectorized GOP & Prosody Alignment:
-     - Quy hoạch động CTC Forward chạy song song trên GPU.
-     - Single-pass Viterbi Alignment dùng chung cho cả Prosody và WavLM pooling.
+"""Trích xuất đầy đủ 100% các nhóm Feature trên GPU cho Baseline GOPT tốt nhất (Kèm Profiler chi tiết).
 
 Bộ Feature được trích xuất gồm:
-  1. KoelLabs-GOP 80-d (`feat` [N, 150, 80]) + Occupancy (`occ` [N, 150])
+  1. KoelLabs-GOP 80-d (`feat` [N, 150, 80])
   2. Prosody 8-d (`dur` [N, 150] + `eng` [N, 150, 7])
   3. WavLM SSL (`wavlm` [N, 150, 1024] fp16)
 """
@@ -42,7 +32,12 @@ from vh_gopt.core.koel_gop import map_phones_to_ids_koel
 SPLITS = ["train", "val", "test_unseen_speakers", "test_unseen_prompts"]
 
 
-def print_cuda_diagnostics(device, koel_model, wl_model=None, use_fp16=True, use_compile=False, batch_size=16, num_workers=2):
+def sync_cuda(device):
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+def print_cuda_diagnostics(device, koel_model, wl_model=None, use_fp16=True, batch_size=16, num_workers=2):
     """Kiểm tra và in chi tiết trạng thái nạp model vào GPU/CUDA."""
     print("\n" + "=" * 70)
     print("🔍 [CUDA & ENGINE DIAGNOSTICS] KIỂM TRA THIẾT BỊ VÀ TRẠNG THÁI TỐI ƯU:")
@@ -59,7 +54,6 @@ def print_cuda_diagnostics(device, koel_model, wl_model=None, use_fp16=True, use
         print(f" • GPU Tên                : 🚀 {gpu_name}")
         print(f" • VRAM Bộ nhớ           : {vram_alloc:.2f} GB / {vram_total:.2f} GB (Allocated / Total)")
         print(f" • Tensor Cores (FP16)   : {'✅ BẬT (Half Precision)' if use_fp16 else '❌ TẮT (FP32)'}")
-        print(f" • Torch Compile Engine  : {'⚡ BẬT (TorchInductor Fusion)' if use_compile else 'OFF (Standard Eager)'}")
     
     koel_dev = next(koel_model.parameters()).device
     koel_dtype = next(koel_model.parameters()).dtype
@@ -204,25 +198,47 @@ def extract_split_features(split_name, ds_split, out_path,
     ids_list = [""] * N
     texts_list = [""] * N
 
+    # Profiling accumulators
+    prof = {
+        "data_wait": 0.0,
+        "koel_fwd": 0.0,
+        "wavlm_fwd": 0.0,
+        "gop_dp": 0.0,
+        "alignment_prosody": 0.0,
+        "wavlm_pool": 0.0,
+        "total_utt_count": 0,
+    }
+
     t0 = time.time()
     curr_idx = 0
     pbar = tqdm(total=N, desc=f"Extracting {split_name}", unit="utt")
+    batch_idx = 0
 
+    t_data_start = time.time()
     for batch in loader:
+        t_data_end = time.time()
+        prof["data_wait"] += (t_data_end - t_data_start)
+
         B = len(batch)
         batch_wavs = [item["wav"] for item in batch]
 
         # ---- PHASE 1: BATCHED GPU NEURAL INFERENCE (KOELLABS CTC) ----
+        sync_cuda(device)
+        t_k0 = time.time()
         iv = koel_processor(batch_wavs, sampling_rate=16000, padding=True, return_tensors="pt").input_values.to(device)
         if use_fp16 and device.startswith("cuda"):
             iv = iv.half()
 
         with torch.inference_mode():
             batch_koel_logits = koel_model(iv).logits  # [B, T_max, 80]
+        sync_cuda(device)
+        prof["koel_fwd"] += (time.time() - t_k0)
 
         # ---- PHASE 2: BATCHED GPU NEURAL INFERENCE (TRUNCATED WAVLM) ----
         batch_wl_hs = None
         if use_wavlm and wl_model is not None:
+            sync_cuda(device)
+            t_w0 = time.time()
             wf = wl_fe(batch_wavs, sampling_rate=16000, padding=True, return_tensors="pt").input_values.to(device)
             if use_fp16 and device.startswith("cuda"):
                 wf = wf.half()
@@ -230,6 +246,8 @@ def extract_split_features(split_name, ds_split, out_path,
             with torch.inference_mode():
                 wl_out = wl_model(wf, output_hidden_states=True)
                 batch_wl_hs = wl_out.hidden_states[wl_layer]  # [B, Tw_max, 1024]
+            sync_cuda(device)
+            prof["wavlm_fwd"] += (time.time() - t_w0)
 
         # ---- PHASE 3: VECTORIZED GPU GOP & ALIGNMENT PROCESSING ----
         for b in range(B):
@@ -263,17 +281,19 @@ def extract_split_features(split_name, ds_split, out_path,
             if S > 0:
                 labels_koel, _ = map_phones_to_ids_koel(canon_phones, koel_processor.tokenizer)
                 labels_t = torch.tensor(labels_koel, dtype=torch.long, device=device)
-
                 koel_logits = batch_koel_logits[b, :T_actual]
 
-                # GOP trên GPU
+                # 3A. GOP Dynamic Programming
+                sync_cuda(device)
+                t_g0 = time.time()
                 post = torch.softmax(koel_logits.float(), dim=-1).type(torch.float64).T
                 gop_res, occ_res = extract_utt_feats_norm_fast(post, labels_t, blank=blank_id, occ=False)
                 feat[i, :S] = gop_res.numpy()[:S]
-                if occ_res is not None:
-                    occ[i, :S] = occ_res.numpy()[:S]
+                sync_cuda(device)
+                prof["gop_dp"] += (time.time() - t_g0)
 
-                # Single-pass Alignment + Prosody
+                # 3B. Single-pass Viterbi Alignment & Prosody
+                t_a0 = time.time()
                 logp = koel_logits.float().log_softmax(-1).cpu().double()
                 labels_cpu = labels_t.cpu()
                 segs, T_ctc, _ = phone_segments(logp, labels_cpu, blank=blank_id)
@@ -282,9 +302,11 @@ def extract_split_features(split_name, ds_split, out_path,
                     d_res, e_res = phone_prosody_from_segs(segs, T_ctc, wav_data, S)
                     dur[i, :S] = d_res[:S]
                     eng[i, :S] = e_res[:S]
+                prof["alignment_prosody"] += (time.time() - t_a0)
 
-                # WavLM Mean-Pooling
+                # 3C. WavLM Mean-Pooling
                 if use_wavlm and batch_wl_hs is not None and segs is not None:
+                    t_p0 = time.time()
                     Tw_actual = max(1, int(len(wav_data) // 320))
                     hs = batch_wl_hs[b, :Tw_actual].float().cpu()  # [Tw, 1024]
                     Tw = hs.shape[0]
@@ -294,9 +316,34 @@ def extract_split_features(split_name, ds_split, out_path,
                             break
                         a2, b2 = int(a * ratio), max(int(b_seg * ratio), int(a * ratio) + 1)
                         wavlm[i, k] = hs[a2:min(b2, Tw)].mean(0).numpy().astype(np.float16)
+                    prof["wavlm_pool"] += (time.time() - t_p0)
 
         curr_idx += B
+        prof["total_utt_count"] += B
+        batch_idx += 1
         pbar.update(B)
+
+        # In bảng Profiler chi tiết mỗi 5 batch đầu tiên và sau đó mỗi 20 batch
+        if (batch_idx <= 5) or (batch_idx % 20 == 0):
+            c = prof["total_utt_count"]
+            t_data_ms = (prof["data_wait"] / c) * 1000
+            t_koel_ms = (prof["koel_fwd"] / c) * 1000
+            t_wl_ms = (prof["wavlm_fwd"] / c) * 1000
+            t_gop_ms = (prof["gop_dp"] / c) * 1000
+            t_align_ms = (prof["alignment_prosody"] / c) * 1000
+            t_pool_ms = (prof["wavlm_pool"] / c) * 1000
+            t_sum_ms = t_data_ms + t_koel_ms + t_wl_ms + t_gop_ms + t_align_ms + t_pool_ms
+
+            pbar.write(
+                f"⏱️ [PROFILER | {curr_idx}/{N} utts] Thời gian TB: {t_sum_ms:.1f} ms/utt ({t_sum_ms/1000:.3f}s) | "
+                f"Data(CPU): {t_data_ms:.1f}ms ({(t_data_ms/t_sum_ms)*100:.1f}%) | "
+                f"Koel(GPU): {t_koel_ms:.1f}ms ({(t_koel_ms/t_sum_ms)*100:.1f}%) | "
+                f"WavLM(GPU): {t_wl_ms:.1f}ms ({(t_wl_ms/t_sum_ms)*100:.1f}%) | "
+                f"GOP(DP): {t_gop_ms:.1f}ms ({(t_gop_ms/t_sum_ms)*100:.1f}%) | "
+                f"Align+Pros: {t_align_ms:.1f}ms ({(t_align_ms/t_sum_ms)*100:.1f}%)"
+            )
+
+        t_data_start = time.time()
 
     pbar.close()
     out_dir = Path(out_path).parent
@@ -460,7 +507,6 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     ap.add_argument("--batch-size", type=int, default=16, help="Batch size chạy GPU (mặc định: 16)")
     ap.add_argument("--num-workers", type=int, default=2, help="Số worker CPU giải mã âm thanh (Colab tối ưu = 2)")
-    ap.add_argument("--compile", action="store_true", help="Bật torch.compile JIT tối ưu kernel fusion trên GPU")
     ap.add_argument("--no-fp16", action="store_true", help="Tắt chế độ FP16 trên GPU")
     ap.add_argument("--no-wavlm", action="store_true", help="Bỏ qua trích xuất WavLM")
     ap.add_argument("--no-prosody", action="store_true", help="Bỏ qua trích xuất Prosody")
@@ -491,11 +537,9 @@ def main():
     koel_model = AutoModelForCTC.from_pretrained(args.acoustic_model).to(args.device).eval()
     if use_fp16:
         koel_model = koel_model.half()
-    if args.compile and hasattr(torch, "compile") and args.device.startswith("cuda"):
-        print("   ⚡ Đang kích hoạt torch.compile cho KoelLabs (dynamic=True)...")
-        koel_model = torch.compile(koel_model, dynamic=True)
     blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
 
+    # 2. Nạp WavLM Model (Cắt ngắn đúng Layer 12 để loại bỏ 50% tính toán thừa)
     wl_model, wl_fe = None, None
     use_wavlm = not args.no_wavlm
     if use_wavlm:
@@ -507,12 +551,9 @@ def main():
         wl_model.encoder.layers = wl_model.encoder.layers[:args.wavlm_layer + 1]
         if use_fp16:
             wl_model = wl_model.half()
-        if args.compile and hasattr(torch, "compile") and args.device.startswith("cuda"):
-            print("   ⚡ Đang kích hoạt torch.compile cho WavLM (dynamic=True)...")
-            wl_model = torch.compile(wl_model, dynamic=True)
 
     # 3. In bảng kiểm tra CUDA Diagnostics
-    print_cuda_diagnostics(args.device, koel_model, wl_model, use_fp16, args.compile, args.batch_size, args.num_workers)
+    print_cuda_diagnostics(args.device, koel_model, wl_model, use_fp16, args.batch_size, args.num_workers)
 
     # 4. Chạy trích xuất từng Split với Batched Pipeline
     for s in splits:
