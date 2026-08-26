@@ -240,6 +240,8 @@ def main():
     ap.add_argument("--max-len", type=int, default=150)
     ap.add_argument("--limit", type=int, default=0, help="Giới hạn số mẫu/split để smoke test (0 = tất cả)")
     ap.add_argument("--splits", default=",".join(SPLITS))
+    ap.add_argument("--push-repo", default=None, help="Repo HF để đẩy toàn bộ dataset có đủ Feature lên (vd: <org>/gopt-vh-gold-features)")
+    ap.add_argument("--public", action="store_true", help="Công khai repo HF (mặc định private)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -297,6 +299,118 @@ def main():
     print(f"  ./run.sh train --train {out_dir}/train.npz --test {out_dir}/test_unseen_speakers.npz --epochs 80 --use-wavlm --wavlm-fuse stack --wavlm-dim 32 --utt-prosody")
     print("============================================================")
 
+    if args.push_repo:
+        push_extracted_features_to_hub(
+            npz_dir=str(out_dir),
+            splits=splits,
+            repo=args.push_repo,
+            public=args.public,
+        )
+
+
+def push_extracted_features_to_hub(npz_dir, splits, repo, public=False):
+    from datasets import Array2D, Dataset, DatasetDict, Features, Sequence, Value
+    from huggingface_hub import HfApi
+
+    print(f"\n>> Đang đóng gói và đẩy dataset có đủ Feature lên HuggingFace: {repo} ...")
+    dd = {}
+    for s in splits:
+        p = os.path.join(npz_dir, f"{s}.npz")
+        if not os.path.exists(p):
+            continue
+        z = np.load(p, allow_pickle=False)
+        N, L = int(z["N"]), int(z["max_len"])
+        seq = lambda dt, n=L: Sequence(Value(dt), length=n)  # noqa: E731
+
+        feats_dict = {
+            "id": Value("string"),
+            "text": Value("string"),
+            "phone_list": Sequence(Value("string"), length=39),
+            "utt_heads": Sequence(Value("string"), length=4),
+            "word_heads": Sequence(Value("string"), length=1),
+            "scale": Value("string"),
+            "max_len": Value("int32"),
+            "phn": seq("int16"),
+            "phone_label": seq("float32"),
+            "phone_weight": seq("float32"),
+            "n_vendors": seq("uint8"),
+            "word_id": seq("int16"),
+            "word_acc": seq("float32"),
+            "word_weight": seq("float32"),
+            "msdd_type": seq("int16"),
+            "msdd_sub": seq("int16"),
+            "utt_label": Sequence(Value("float32"), length=4),
+            "utt_weight": Sequence(Value("float32"), length=4),
+            "utt_nv": Sequence(Value("uint8"), length=4),
+            "feat": Array2D(shape=(L, 80), dtype="float32"),
+            "occ": seq("float32"),
+            "dur": seq("float32"),
+            "eng": Array2D(shape=(L, 7), dtype="float32"),
+        }
+        if "wavlm" in z and z["wavlm"].shape[-1] == 1024:
+            feats_dict["wavlm"] = Array2D(shape=(L, 1024), dtype="float16")
+            feats_dict["wavlm_layer"] = Value("int32")
+
+        cols_data = {
+            "id": [str(x) for x in z["ids"]],
+            "text": [str(x) for x in z["texts"]],
+            "phone_list": [[str(x) for x in z["phone_list"]]] * N,
+            "utt_heads": [[str(x) for x in z["utt_heads"]]] * N,
+            "word_heads": [[str(x) for x in z["word_heads"]]] * N,
+            "scale": [str(z["scale"])] * N,
+            "max_len": [L] * N,
+        }
+        for k in ["phn", "phone_label", "phone_weight", "n_vendors",
+                  "word_id", "word_acc", "word_weight",
+                  "msdd_type", "msdd_sub", "utt_label", "utt_weight", "utt_nv",
+                  "feat", "occ", "dur", "eng"]:
+            arr = z[k]
+            cols_data[k] = list(arr) if arr.ndim > 1 else arr.tolist()
+
+        if "wavlm" in feats_dict:
+            cols_data["wavlm"] = list(z["wavlm"])
+            cols_data["wavlm_layer"] = [int(z.get("wavlm_layer", 12))] * N
+
+        ds = Dataset.from_dict(cols_data, features=Features(feats_dict))
+        dd[s] = ds
+        print(f"  [HF pack] {s}: {len(ds):,} rows")
+
+    dsdict = DatasetDict(dd)
+    private = not public
+    dsdict.push_to_hub(repo, private=private)
+
+    card = f"""---
+language:
+- en
+pretty_name: "VuiHoc GOPT Gold Features (GOP-80d + Prosody-8d + WavLM-1024d)"
+tags:
+- goodness-of-pronunciation
+- pronunciation-assessment
+- wavlm
+- gopt
+size_categories:
+- 1K<n<10K
+
+# VuiHoc GOPT Gold Features (Đã trích xuất đầy đủ Feature)
+
+Dataset GOPT VuiHoc Gold (6,361 câu) đã được trích xuất sẵn toàn bộ Feature trên GPU:
+- `feat` [150, 80]: KoelLabs-GOP (log-posterior ratio normalized)
+- `occ` [150]: Soft occupancy
+- `dur` [150] + `eng` [150, 7]: Prosody 8-d (Viterbi forced alignment + RMSE energy)
+- `wavlm` [150, 1024]: WavLM-large Layer 12 pooled per-phone (fp16)
+- Nhãn: `phn`, `phone_label`, `word_acc`, `utt_label`, `msdd_type`, `msdd_sub`
+
+## Load trực tiếp để train
+
+```python
+from datasets import load_dataset
+ds = load_dataset("{repo}")
+```
+"""
+    api = HfApi()
+    api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
+                    repo_id=repo, repo_type="dataset")
+    print(f">> ĐÃ PUSH THÀNH CÔNG FEATURE DATASET LÊN HF: https://huggingface.co/datasets/{repo} (private={private})")
 
 if __name__ == "__main__":
     main()
