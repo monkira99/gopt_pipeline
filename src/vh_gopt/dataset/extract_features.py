@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Trích xuất đầy đủ 100% các nhóm Feature trên GPU cho Baseline GOPT tốt nhất (Ultra-Fast Batched GPU Version).
+"""Trích xuất đầy đủ 100% các nhóm Feature trên GPU cho Baseline GOPT tốt nhất (Decoupled High-Throughput Pipeline).
 
-Tối ưu hóa hiệu năng đỉnh cao:
-  1. Truncate WavLM: Chỉ chạy đến đúng Layer 12 (loại bỏ 50% tính toán thừa của layer 13-24).
-  2. Smart Length-Bucket Batching: Gom các audio có độ dài tương tự vào cùng batch (loại bỏ 60% lãng phí do zero-padding).
-  3. Batched GPU Forward Pass (Batch Size = 8-16) bão hòa nhân Tensor Cores.
-  4. Multi-worker PyTorch DataLoader bất đồng bộ trong background.
-  5. Vectorized GPU CTC Forward & Occupancy.
+Kiến trúc tách biệt CPU / GPU tối ưu tối đa:
+  1. CPU Background Producer (Multi-worker DataLoader, Pinned Memory):
+     - Giải mã MP3, resample 16kHz, mapping token canonical chạy bất đồng bộ trong background.
+  2. Pure GPU Neural Inference (KoelLabs CTC + Truncated WavLM Layer 12):
+     - Chạy theo Batch (16-32) trên CUDA Tensor Cores ở chế độ FP16 (`torch.inference_mode()`).
+     - Hỗ trợ `torch.compile(mode="reduce-overhead")` (Inductor kernel fusion).
+  3. Vectorized GOP & Prosody Alignment:
+     - Quy hoạch động CTC Forward chạy song song trên GPU.
+     - Single-pass Viterbi Alignment dùng chung cho cả Prosody và WavLM pooling.
+
+Bộ Feature được trích xuất gồm:
+  1. KoelLabs-GOP 80-d (`feat` [N, 150, 80]) + Occupancy (`occ` [N, 150])
+  2. Prosody 8-d (`dur` [N, 150] + `eng` [N, 150, 7])
+  3. WavLM SSL (`wavlm` [N, 150, 1024] fp16)
 """
 import argparse
 import io
@@ -34,22 +42,24 @@ from vh_gopt.core.koel_gop import map_phones_to_ids_koel
 SPLITS = ["train", "val", "test_unseen_speakers", "test_unseen_prompts"]
 
 
-def print_cuda_diagnostics(device, koel_model, wl_model=None, use_fp16=True, batch_size=8, num_workers=2):
+def print_cuda_diagnostics(device, koel_model, wl_model=None, use_fp16=True, use_compile=False, batch_size=16, num_workers=2):
     """Kiểm tra và in chi tiết trạng thái nạp model vào GPU/CUDA."""
-    print("\n" + "=" * 68)
-    print("🔍 [CUDA DIAGNOSTICS] KIỂM TRA THIẾT BỊ VÀ TRẠNG THÁI NẠP MODEL:")
-    print("=" * 68)
+    print("\n" + "=" * 70)
+    print("🔍 [CUDA & ENGINE DIAGNOSTICS] KIỂM TRA THIẾT BỊ VÀ TRẠNG THÁI TỐI ƯU:")
+    print("=" * 70)
     
     cuda_avail = torch.cuda.is_available()
-    print(f" • PyTorch version       : {torch.__version__}")
-    print(f" • CUDA khả dụng          : {'✅ CÓ (CUDA Available)' if cuda_avail else '❌ KHÔNG (Chỉ có CPU)'}")
+    print(f" • PyTorch Version       : {torch.__version__}")
+    print(f" • CUDA Khả dụng          : {'✅ CÓ (CUDA Available)' if cuda_avail else '❌ KHÔNG (Chạy CPU)'}")
     
     if cuda_avail:
         gpu_name = torch.cuda.get_device_name(0)
         vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         vram_alloc = torch.cuda.memory_allocated(0) / (1024 ** 3)
-        print(f" • GPU Name              : 🚀 {gpu_name}")
-        print(f" • VRAM                  : {vram_alloc:.2f} GB / {vram_total:.2f} GB (Allocated / Total)")
+        print(f" • GPU Tên                : 🚀 {gpu_name}")
+        print(f" • VRAM Bộ nhớ           : {vram_alloc:.2f} GB / {vram_total:.2f} GB (Allocated / Total)")
+        print(f" • Tensor Cores (FP16)   : {'✅ BẬT (Half Precision)' if use_fp16 else '❌ TẮT (FP32)'}")
+        print(f" • Torch Compile Engine  : {'⚡ BẬT (TorchInductor Fusion)' if use_compile else 'OFF (Standard Eager)'}")
     
     koel_dev = next(koel_model.parameters()).device
     koel_dtype = next(koel_model.parameters()).dtype
@@ -59,11 +69,10 @@ def print_cuda_diagnostics(device, koel_model, wl_model=None, use_fp16=True, bat
         wl_dev = next(wl_model.parameters()).device
         wl_dtype = next(wl_model.parameters()).dtype
         num_layers = len(wl_model.encoder.layers)
-        print(f" • WavLM SSL Model       : Vị trí = {wl_dev} | Dtype = {wl_dtype} | Layers = {num_layers} (Tối ưu Truncated)")
+        print(f" • WavLM SSL Model       : Vị trí = {wl_dev} | Dtype = {wl_dtype} | Layers = {num_layers} (Truncated 0..12)")
 
-    print(f" • Throughput Tuning     : Batch Size = {batch_size} | DataLoader Workers = {num_workers} | FP16 = {use_fp16}")
-    print(" ✅ Toàn bộ mô hình đã được tối ưu và nạp thành công vào GPU!")
-    print("=" * 68 + "\n")
+    print(f" • Pipeline Configuration: Batch Size = {batch_size} | CPU Background Workers = {num_workers}")
+    print("=" * 70 + "\n")
 
 
 def fast_resample(wav_np, orig_sr, target_sr=16000):
@@ -77,7 +86,7 @@ def fast_resample(wav_np, orig_sr, target_sr=16000):
 
 
 class AudioExtractionDataset(Dataset):
-    """Dataset giải mã âm thanh bất đồng bộ trên đa luồng CPU trong background."""
+    """CPU Background Producer: Giải mã audio và chuẩn bị mảng nhãn bất đồng bộ."""
     def __init__(self, ds_split, limit=0, max_len=150):
         self.ds = ds_split if limit == 0 else ds_split.select(range(min(limit, len(ds_split))))
         self.max_len = max_len
@@ -91,7 +100,7 @@ class AudioExtractionDataset(Dataset):
         rid = str(ex["id"])
         text = str(ex["text"])
 
-        # Giải mã audio
+        # 1. Giải mã audio trên CPU worker
         a_dict = ex["audio"]
         if a_dict.get("bytes") is not None:
             wav_data, sr = sf.read(io.BytesIO(a_dict["bytes"]))
@@ -105,6 +114,7 @@ class AudioExtractionDataset(Dataset):
         if sr != 16000:
             wav_data = fast_resample(wav_data, sr, 16000)
 
+        # 2. Chuẩn bị chuỗi âm vị canonical
         valid_phn_ids = [int(p) for p in ex["phn"] if p >= 0][:self.max_len]
         canon_phones = [self.phone_list[pid] for pid in valid_phn_ids]
 
@@ -202,7 +212,7 @@ def extract_split_features(split_name, ds_split, out_path,
         B = len(batch)
         batch_wavs = [item["wav"] for item in batch]
 
-        # ---- 1. BATCHED KOELLABS CTC FORWARD ----
+        # ---- PHASE 1: BATCHED GPU NEURAL INFERENCE (KOELLABS CTC) ----
         iv = koel_processor(batch_wavs, sampling_rate=16000, padding=True, return_tensors="pt").input_values.to(device)
         if use_fp16 and device.startswith("cuda"):
             iv = iv.half()
@@ -210,7 +220,7 @@ def extract_split_features(split_name, ds_split, out_path,
         with torch.inference_mode():
             batch_koel_logits = koel_model(iv).logits  # [B, T_max, 80]
 
-        # ---- 2. BATCHED WAVLM-LARGE FORWARD (TRUNCATED TO LAYER 12) ----
+        # ---- PHASE 2: BATCHED GPU NEURAL INFERENCE (TRUNCATED WAVLM) ----
         batch_wl_hs = None
         if use_wavlm and wl_model is not None:
             wf = wl_fe(batch_wavs, sampling_rate=16000, padding=True, return_tensors="pt").input_values.to(device)
@@ -221,7 +231,7 @@ def extract_split_features(split_name, ds_split, out_path,
                 wl_out = wl_model(wf, output_hidden_states=True)
                 batch_wl_hs = wl_out.hidden_states[wl_layer]  # [B, Tw_max, 1024]
 
-        # ---- 3. XỬ LÝ TỪNG UTTERANCE TRONG BATCH ----
+        # ---- PHASE 3: VECTORIZED GPU GOP & ALIGNMENT PROCESSING ----
         for b in range(B):
             item = batch[b]
             i = curr_idx + b
@@ -448,8 +458,9 @@ def main():
     ap.add_argument("--wavlm-model", default="microsoft/wavlm-large")
     ap.add_argument("--wavlm-layer", type=int, default=12)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-    ap.add_argument("--batch-size", type=int, default=16, help="Batch size chạy GPU (mặc định: 16; T4 16GB tối ưu ở 16)")
+    ap.add_argument("--batch-size", type=int, default=16, help="Batch size chạy GPU (mặc định: 16)")
     ap.add_argument("--num-workers", type=int, default=2, help="Số worker CPU giải mã âm thanh (Colab tối ưu = 2)")
+    ap.add_argument("--compile", action="store_true", help="Bật torch.compile JIT tối ưu kernel fusion trên GPU")
     ap.add_argument("--no-fp16", action="store_true", help="Tắt chế độ FP16 trên GPU")
     ap.add_argument("--no-wavlm", action="store_true", help="Bỏ qua trích xuất WavLM")
     ap.add_argument("--no-prosody", action="store_true", help="Bỏ qua trích xuất Prosody")
@@ -480,6 +491,9 @@ def main():
     koel_model = AutoModelForCTC.from_pretrained(args.acoustic_model).to(args.device).eval()
     if use_fp16:
         koel_model = koel_model.half()
+    if args.compile and hasattr(torch, "compile") and args.device.startswith("cuda"):
+        print("   ⚡ Đang kích hoạt torch.compile cho KoelLabs...")
+        koel_model = torch.compile(koel_model, mode="reduce-overhead")
     blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
 
     # 2. Nạp WavLM Model (Cắt ngắn đúng Layer 12 để loại bỏ 50% tính toán thừa)
@@ -490,13 +504,16 @@ def main():
         print(f"\n[2/2] Nạp WavLM SSL Model: {args.wavlm_model} (Layer {args.wavlm_layer}) ...")
         wl_fe = AutoFeatureExtractor.from_pretrained(args.wavlm_model)
         wl_model = WavLMModel.from_pretrained(args.wavlm_model, attn_implementation="eager").to(args.device).eval()
-        # TỐI ƯU CỐT LÕI: Truncate WavLM encoder tới Layer 12 (bỏ hoàn toàn layer 13-24)
+        # Truncate WavLM encoder tới Layer 12
         wl_model.encoder.layers = wl_model.encoder.layers[:args.wavlm_layer + 1]
         if use_fp16:
             wl_model = wl_model.half()
+        if args.compile and hasattr(torch, "compile") and args.device.startswith("cuda"):
+            print("   ⚡ Đang kích hoạt torch.compile cho WavLM...")
+            wl_model = torch.compile(wl_model, mode="reduce-overhead")
 
     # 3. In bảng kiểm tra CUDA Diagnostics
-    print_cuda_diagnostics(args.device, koel_model, wl_model, use_fp16, args.batch_size, args.num_workers)
+    print_cuda_diagnostics(args.device, koel_model, wl_model, use_fp16, args.compile, args.batch_size, args.num_workers)
 
     # 4. Chạy trích xuất từng Split với Batched Pipeline
     for s in splits:
