@@ -13,6 +13,7 @@ set -euo pipefail
 # Giu cwd cua nguoi goi: cac path tuong doi (data/, cache/) tinh theo noi chay.
 # Uu tien .venv trong thu muc module, roi .venv thu muc cha (layout monorepo); PY=... de override.
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}"
 if [ -z "${PY:-}" ]; then
   if [ -x "$ROOT/.venv/bin/python" ]; then PY="$ROOT/.venv/bin/python"
   elif [ -x "$ROOT/../.venv/bin/python" ]; then PY="$ROOT/../.venv/bin/python"
@@ -21,7 +22,7 @@ fi
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
-  install) "$PY" -m pip install -e . ;;
+  install) "$PY" -m pip install -e "$ROOT" ;;
   snapshot) "$PY" -m vh_gopt.dataset.snapshot_corpus "$@" ;;
   fetch)    "$PY" -m vh_gopt.dataset.fetch_corpus "$@" ;;
   pack)     "$PY" -m vh_gopt.dataset.pack_stage2 "$@" ;;
