@@ -1,0 +1,55 @@
+# ============================================================================
+# Stage 2 sweep — DECOUPLE: WavLM-64 stack + attn_pool (per-aspect attention
+# pooling cho head utt thay CLS) -> utt tự đọc token cần, gỡ cạnh tranh với phone/word.
+# ============================================================================
+experiment_name: "stage2_sweep_attnpool_fp"
+
+dataset:
+  hf_dataset: "tiennguyenbnbk/gopt-vh-gold-features"
+  train: "train"
+  val: "val"
+  test: "test_unseen_speakers"
+  test2: "test_unseen_prompts"
+  scale: "0-100"
+
+features:
+  acoustic_model: "KoelLabs/xlsr-english-01"
+  gop_map: "koel"
+  use_occ: false
+  use_prosody: false
+  utt_prosody: true
+  use_wavlm: true
+  wavlm_dim: 64
+  wavlm_fuse: "phone"
+
+model:
+  model: "gopt"
+  arch: "base"
+  embed_dim: 24
+  depth: 3
+  heads: 1
+  dropout: 0.20
+  noise: 0.10
+  attn_pool: true          # per-aspect attention pool cho head utt (thay learnable CLS)
+
+training:
+  epochs: 80
+  bs: 25
+  lr: 0.001
+  wd: 0.0001
+  sched: "cosine"
+  w_phn: 1.0
+  w_word: 1.0
+  w_utt: 1.0
+  best_metric: "mean"
+  early_stop_patience: 12
+  early_stop_threshold: 0.0
+  seed: 0
+
+logging:
+  out: "ckpt/sweep_attnpool_fp"
+  wandb_project: "gopt-vh-experiments"
+  wandb_run: "sweep-attnpool-fp"
+  no_wandb: true
+  push_model: false
+  hf_repo: "tiennguyenbnbk/gopt-vh-baseline-wavlm32"

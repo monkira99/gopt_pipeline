@@ -1,0 +1,54 @@
+# ============================================================================
+# Stage 2: Best Baseline (KoelLabs-80d + WavLM-32 stack + Utterance-Prosody)
+# ============================================================================
+
+experiment_name: "stage2_baseline_wavlm32"
+
+dataset:
+  hf_dataset: "tiennguyenbnbk/gopt-vh-gold-features"   # đọc thẳng từ HF (feat/prosody/wavlm)
+  train: "train"
+  val: "val"                                            # chọn best checkpoint trên VAL
+  test: "test_unseen_speakers"                          # test chính
+  test2: "test_unseen_prompts"                          # test phụ (báo cáo thêm)
+  scale: "0-100"
+
+features:
+  acoustic_model: "KoelLabs/xlsr-english-01"
+  gop_map: "koel"
+  use_occ: false
+  use_prosody: false
+  utt_prosody: true        # Bơm 8-d prosody riêng vào nhánh Utterance
+  use_wavlm: true          # Bật WavLM SSL
+  wavlm_dim: 64            # Sweet-spot chống overfit (PCA 32-d)
+  wavlm_fuse: "stack"      # Concat 80d + 32d = 112d vào encoder
+
+model:
+  model: "gopt"
+  arch: "base"
+  embed_dim: 48
+  depth: 4
+  heads: 4
+  dropout: 0.20
+  noise: 0.10
+
+training:
+  epochs: 80
+  bs: 25
+  lr: 0.001
+  wd: 0.0001
+  sched: "cosine"
+  w_phn: 1.0
+  w_word: 1.0
+  w_utt: 1.0
+  best_metric: "mean"
+  early_stop_patience: 12    # dừng nếu val mean-PCC không cải thiện 12 epoch
+  early_stop_threshold: 0.0
+  seed: 0
+
+logging:
+  out: "ckpt/stage2_baseline_wavlm32"
+  wandb_project: "gopt-vh-experiments"
+  wandb_run: "stage2-baseline-wavlm32"
+  no_wandb: false
+  push_model: true
+  hf_repo: "tiennguyenbnbk/gopt-vh-baseline-wavlm32"

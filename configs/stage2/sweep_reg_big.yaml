@@ -1,0 +1,54 @@
+# ============================================================================
+# Stage 2 sweep — big (capacity+feature) + REGULARIZE mạnh để diệt overfit
+# (big có vh-test cao nhất nhưng kid tệ nhất). Kỳ vọng: cả 2 knob cùng thắng.
+# ============================================================================
+experiment_name: "stage2_sweep_reg_big"
+
+dataset:
+  hf_dataset: "tiennguyenbnbk/gopt-vh-gold-features"
+  train: "train"
+  val: "val"
+  test: "test_unseen_speakers"
+  test2: "test_unseen_prompts"
+  scale: "0-100"
+
+features:
+  acoustic_model: "KoelLabs/xlsr-english-01"
+  gop_map: "koel"
+  use_occ: false
+  use_prosody: false
+  utt_prosody: true
+  use_wavlm: true
+  wavlm_dim: 64
+  wavlm_fuse: "stack"
+
+model:
+  model: "gopt"
+  arch: "base"
+  embed_dim: 48
+  depth: 4
+  heads: 4
+  dropout: 0.35            # mạnh hơn 0.20 -> chống overfit capacity
+  noise: 0.15             # tăng input noise reg
+
+training:
+  epochs: 80
+  bs: 25
+  lr: 0.001
+  wd: 0.001               # tăng weight decay 10x (0.0001 -> 0.001)
+  sched: "cosine"
+  w_phn: 1.0
+  w_word: 1.0
+  w_utt: 1.0
+  best_metric: "mean"
+  early_stop_patience: 12
+  early_stop_threshold: 0.0
+  seed: 0
+
+logging:
+  out: "ckpt/sweep_reg_big"
+  wandb_project: "gopt-vh-experiments"
+  wandb_run: "sweep-reg-big"
+  no_wandb: true
+  push_model: false
+  hf_repo: "tiennguyenbnbk/gopt-vh-baseline-wavlm32"
