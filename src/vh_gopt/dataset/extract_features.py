@@ -492,13 +492,12 @@ def main():
     if use_fp16:
         koel_model = koel_model.half()
     if args.compile and hasattr(torch, "compile") and args.device.startswith("cuda"):
-        print("   ⚡ Đang kích hoạt torch.compile cho KoelLabs...")
-        koel_model = torch.compile(koel_model, mode="reduce-overhead")
-    blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
-
-    if args.compile and hasattr(torch, "compile") and args.device.startswith("cuda"):
         print("   ⚡ Đang kích hoạt torch.compile cho KoelLabs (dynamic=True)...")
         koel_model = torch.compile(koel_model, dynamic=True)
+    blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
+
+    wl_model, wl_fe = None, None
+    use_wavlm = not args.no_wavlm
     if use_wavlm:
         from transformers import AutoFeatureExtractor, WavLMModel
         print(f"\n[2/2] Nạp WavLM SSL Model: {args.wavlm_model} (Layer {args.wavlm_layer}) ...")
