@@ -49,7 +49,7 @@ training:
   # --- score-balanced weighting (Do et al. 2023) ---
   balanced: true
   bins: 10               # 0-100 chia 10 bin rộng 10 điểm
-  beta: 0.999
+  beta: 0.9999           # n phone lớn (281k) -> beta 0.999 bão hoà (weight phẳng); 0.9999 mới rebalance thật (phone w ~0.87-2.65)
   balance_heads: "all"   # cân cả phone/word (bw_phn) lẫn utt (bw_utt)
   wcap: 5.0              # chặn trọng số bin thưa <= 5x
 
