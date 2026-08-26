@@ -1,7 +1,7 @@
 """Fast GOP feature-vector extraction (is24 gop-af-feats style), GPU FP32 Tensor Core accelerated.
 
 Key speedup:
-  1. Vectorized along the CTC state lattice L on CUDA FP32 Tensor Cores (eliminating slow FP64 emulation).
+  1. Vectorized along the CTC state lattice L on CUDA FP32 Tensor Cores.
   2. Batched across all B substitution candidates in a single high-throughput pass on GPU.
   3. Single-pass forward algorithm directly on CUDA.
 """
@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 
-def ctc_forward_batch_norm(params, seqmat, blank=0):
+def ctc_forward_batch_norm(params: torch.Tensor, seqmat: torch.Tensor, blank: int = 0) -> torch.Tensor:
     """Vectorized scaled-forward batched across all B sequences on CUDA FP32.
     params: [P, T] (emission probabilities, float32)
     seqmat: [B, S] (token sequences)
@@ -18,7 +18,7 @@ def ctc_forward_batch_norm(params, seqmat, blank=0):
     B, S = seqmat.shape
     L = 2 * S + 1
     device = params.device
-    dtype = params.dtype  # float32
+    dtype = params.dtype
 
     tok = torch.full((B, L), blank, dtype=torch.long, device=device)
     odd_idx = torch.arange(1, L, 2, device=device)
@@ -55,7 +55,7 @@ def ctc_forward_batch_norm(params, seqmat, blank=0):
     return -torch.log(alpha_bar).sum(dim=1)
 
 
-def canonical_occupancy(params, labels, blank=0):
+def canonical_occupancy(params: torch.Tensor, labels: torch.Tensor, blank: int = 0) -> torch.Tensor:
     """Vectorized Per-phone occupancy on canonical sequence."""
     P, T = params.shape
     S = labels.shape[0]
@@ -105,8 +105,9 @@ def canonical_occupancy(params, labels, blank=0):
     return occ
 
 
-def extract_utt_feats_norm_fast(params, labels, blank=0, occ=False, cap_elems=5e8):
-    """Vectorized high-throughput GOP feature-vector extraction on GPU/CPU (FP32)."""
+def extract_utt_feats_norm_fast(params: torch.Tensor, labels: torch.Tensor, blank: int = 0, occ: bool = False, cap_elems: float = 5e8):
+    """Vectorized high-throughput GOP feature-vector extraction on GPU/CPU (FP32).
+    cap_elems=5e8 cho phép gom toàn bộ candidate của câu vào 1 pass duy nhất."""
     P, T = params.shape
     S = labels.shape[0]
     device = params.device

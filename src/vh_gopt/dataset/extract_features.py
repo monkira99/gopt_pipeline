@@ -225,12 +225,14 @@ def extract_split_features(split_name, ds_split, out_path,
         # ---- PHASE 1: BATCHED GPU NEURAL INFERENCE (KOELLABS CTC) ----
         sync_cuda(device)
         t_k0 = time.time()
-        iv = koel_processor(batch_wavs, sampling_rate=16000, padding=True, return_tensors="pt").input_values.to(device)
+        k_inp = koel_processor(batch_wavs, sampling_rate=16000, padding=True, return_tensors="pt")
+        iv = k_inp.input_values.to(device)
         if use_fp16 and device.startswith("cuda"):
             iv = iv.half()
+        k_mask = k_inp.attention_mask.to(device) if (hasattr(k_inp, "attention_mask") and k_inp.attention_mask is not None) else None
 
         with torch.inference_mode():
-            batch_koel_logits = koel_model(iv).logits  # [B, T_max, 80]
+            batch_koel_logits = koel_model(iv, attention_mask=k_mask).logits  # [B, T_max, 80]
         sync_cuda(device)
         prof["koel_fwd"] += (time.time() - t_k0)
 
@@ -239,12 +241,14 @@ def extract_split_features(split_name, ds_split, out_path,
         if use_wavlm and wl_model is not None:
             sync_cuda(device)
             t_w0 = time.time()
-            wf = wl_fe(batch_wavs, sampling_rate=16000, padding=True, return_tensors="pt").input_values.to(device)
+            w_inp = wl_fe(batch_wavs, sampling_rate=16000, padding=True, return_tensors="pt")
+            wf = w_inp.input_values.to(device)
             if use_fp16 and device.startswith("cuda"):
                 wf = wf.half()
+            w_mask = w_inp.attention_mask.to(device) if (hasattr(w_inp, "attention_mask") and w_inp.attention_mask is not None) else None
 
             with torch.inference_mode():
-                wl_out = wl_model(wf, output_hidden_states=True)
+                wl_out = wl_model(wf, attention_mask=w_mask, output_hidden_states=True)
                 batch_wl_hs = wl_out.hidden_states[wl_layer]  # [B, Tw_max, 1024]
             sync_cuda(device)
             prof["wavlm_fwd"] += (time.time() - t_w0)
@@ -535,7 +539,10 @@ def main():
     from transformers import AutoModelForCTC, AutoProcessor
     print(f"\n[1/2] Nạp Acoustic Model: {args.acoustic_model} ...")
     koel_proc = AutoProcessor.from_pretrained(args.acoustic_model)
-    koel_model = AutoModelForCTC.from_pretrained(args.acoustic_model).to(args.device).eval()
+    koel_kwargs = {}
+    if hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.device.startswith("cuda"):
+        koel_kwargs["attn_implementation"] = "sdpa"
+    koel_model = AutoModelForCTC.from_pretrained(args.acoustic_model, **koel_kwargs).to(args.device).eval()
     if use_fp16:
         koel_model = koel_model.half()
     blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
