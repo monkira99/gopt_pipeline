@@ -19,6 +19,8 @@ dependencies = [
   "torchcodec",
   "g2p_en",
   "pyyaml",
+  "wandb",
+  "accelerate>=1.1.0",
 ]
 
 [tool.setuptools.packages.find]
