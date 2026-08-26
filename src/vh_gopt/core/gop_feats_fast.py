@@ -1,181 +1,117 @@
-"""
-Fast GOP feature-vector extraction (is24 gop-af-feats style), vectorized.
+"""Fast GOP feature-vector extraction (is24 gop-af-feats style), GPU-vectorized.
 
-Key speedup: the P substitution candidates at a phone position share the same
-sequence length, differing only at that position -> run ONE batched CTC forward
-(batch dim = candidates) instead of P separate Python-loop forwards.
+Key speedup:
+  1. Vectorized along the CTC state lattice L (eliminating slow nested Python loops).
+  2. Batched across all B substitution candidates in parallel on GPU tensor cores.
+  3. Single-pass forward algorithm directly on CUDA.
 """
 import torch
-
-
-def ctc_forward_batch(params, seqmat, blank=0):
-    """
-    params : [P, T]  (shared emission posteriors, float64)
-    seqmat : [B, S]  (int64 token ids; B candidate sequences of equal length S)
-    returns: [B]     forward probability P(seq_b) for each candidate (NOT log)
-    """
-    P, T = params.shape
-    B, S = seqmat.shape
-    L = 2 * S + 1
-    alphas = torch.zeros((B, L, T), dtype=torch.float64)
-    bar = torch.arange(B)
-
-    alphas[:, 0, 0] = params[blank, 0]
-    alphas[:, 1, 0] = params[seqmat[:, 0], 0]
-
-    for t in range(1, T):
-        start = max(0, L - 2 * (T - t))
-        for s in range(start, L):
-            l = (s - 1) // 2
-            if s % 2 == 0:  # blank state
-                if s == 0:
-                    alphas[:, s, t] = alphas[:, s, t - 1] * params[blank, t]
-                else:
-                    alphas[:, s, t] = (alphas[:, s, t - 1] + alphas[:, s - 1, t - 1]) * params[blank, t]
-            else:
-                tok = seqmat[:, l]                      # [B]
-                emit = params[tok, t]                   # [B]
-                two = alphas[:, s, t - 1] + alphas[:, s - 1, t - 1]
-                if s == 1:
-                    alphas[:, s, t] = two * emit
-                else:
-                    same = seqmat[:, l] == seqmat[:, l - 1]     # [B] bool
-                    three = two + alphas[:, s - 2, t - 1]
-                    base = torch.where(same, two, three)
-                    alphas[:, s, t] = base * emit
-    return alphas[:, L - 1, T - 1] + alphas[:, L - 2, T - 1]
-
-
-def ctc_forward_single(params, seq, blank=0):
-    """Non-batched forward prob for one sequence (used for deletion, variable length)."""
-    return ctc_forward_batch(params, seq.view(1, -1), blank=blank)[0]
+import torch.nn.functional as F
 
 
 def ctc_forward_batch_norm(params, seqmat, blank=0):
-    """
-    taslpro26 (2026) NORMALIZED scaled-forward, batched over candidates.
-    params : [P, T] ; seqmat : [B, S] -> returns NLL [B] (= -sum_t log alpha_bar).
+    """Vectorized scaled-forward batched across all B sequences.
+    params: [P, T] (emission probabilities)
+    seqmat: [B, S] (token sequences)
     """
     P, T = params.shape
     B, S = seqmat.shape
     L = 2 * S + 1
-    alphas = torch.zeros((B, L, T), dtype=torch.float64)
-    alpha_bar = torch.zeros((B, T), dtype=torch.float64)
+    device = params.device
 
-    alphas[:, 0, 0] = params[blank, 0]
-    alphas[:, 1, 0] = params[seqmat[:, 0], 0]
-    alpha_bar[:, 0] = alphas[:, :, 0].sum(1)
-    alphas[:, :, 0] = alphas[:, :, 0] / alpha_bar[:, 0:1]
+    tok = torch.full((B, L), blank, dtype=torch.long, device=device)
+    odd_idx = torch.arange(1, L, 2, device=device)
+    tok[:, odd_idx] = seqmat
+
+    can_skip_blank = torch.zeros((B, L), dtype=torch.bool, device=device)
+    if S > 1:
+        same_tok = (seqmat[:, 1:] == seqmat[:, :-1])  # [B, S-1]
+        can_skip_blank[:, 3::2] = ~same_tok
+
+    alphas = torch.zeros((B, L), dtype=torch.float64, device=device)
+    alpha_bar = torch.zeros((B, T), dtype=torch.float64, device=device)
+
+    alphas[:, 0] = params[blank, 0]
+    alphas[:, 1] = params[seqmat[:, 0], 0]
+    alpha_bar[:, 0] = torch.clamp_min(alphas.sum(dim=1), 1e-300)
+    alphas = alphas / alpha_bar[:, 0:1]
+
+    emit_all = params[tok, :]  # [B, L, T]
 
     for t in range(1, T):
-        start = max(0, L - 2 * (T - t))
-        for s in range(start, L):
-            l = (s - 1) // 2
-            if s % 2 == 0:
-                if s == 0:
-                    alphas[:, s, t] = alphas[:, s, t - 1] * params[blank, t]
-                else:
-                    alphas[:, s, t] = (alphas[:, s, t - 1] + alphas[:, s - 1, t - 1]) * params[blank, t]
-            else:
-                tok = seqmat[:, l]
-                emit = params[tok, t]
-                two = alphas[:, s, t - 1] + alphas[:, s - 1, t - 1]
-                if s == 1:
-                    alphas[:, s, t] = two * emit
-                else:
-                    same = seqmat[:, l] == seqmat[:, l - 1]
-                    three = two + alphas[:, s - 2, t - 1]
-                    alphas[:, s, t] = torch.where(same, two, three) * emit
-        alpha_bar[:, t] = alphas[:, :, t].sum(1)
-        alpha_bar[:, t] = torch.clamp_min(alpha_bar[:, t], 1e-300)
-        alphas[:, :, t] = alphas[:, :, t] / alpha_bar[:, t:t + 1]
-    return -(torch.log(alpha_bar).sum(1))
+        v0 = alphas
+        v1 = F.pad(alphas[:, :-1], (1, 0), value=0.0)
+        v2_raw = F.pad(alphas[:, :-2], (2, 0), value=0.0)
+        v2 = torch.where(can_skip_blank, v2_raw, 0.0)
 
+        curr = (v0 + v1 + v2) * emit_all[:, :, t]
 
-def extract_utt_feats_norm(params, labels, blank=0):
-    """
-    2026 GOP-SF feature vector: [LPP(=NLL_canon)] + [LPR per token] using the
-    NORMALIZED forward. LPR = -NLL_canon + NLL_candidate. id 0 slot = deletion.
-    """
-    P, T = params.shape
-    S = labels.shape[0]
-    labels = labels.long()
-    nll_canon = ctc_forward_batch_norm(params, labels.view(1, -1), blank=blank)[0]
-    feats = torch.zeros((S, 1 + P), dtype=torch.float64)
-    feats[:, 0] = nll_canon
-    for i in range(S):
-        seqmat = labels.view(1, -1).repeat(P, 1)
-        seqmat[:, i] = torch.arange(P)
-        nll = ctc_forward_batch_norm(params, seqmat, blank=blank)   # [P]
-        lpr = -nll_canon + nll
-        if S > 1:
-            del_seq = torch.cat([labels[:i], labels[i + 1:]])
-            nll_del = ctc_forward_batch_norm(params, del_seq.view(1, -1), blank=blank)[0]
-            lpr[blank] = -nll_canon + nll_del
-        feats[i, 1:] = lpr
-    return feats, nll_canon.item()
+        bar = torch.clamp_min(curr.sum(dim=1), 1e-300)
+        alpha_bar[:, t] = bar
+        alphas = curr / bar.unsqueeze(1)
+
+    return -torch.log(alpha_bar).sum(dim=1)
 
 
 def canonical_occupancy(params, labels, blank=0):
-    """
-    Per-phone occupancy = expected #frames the phone state is occupied, via a
-    log-space CTC forward-backward on the CANONICAL sequence (one pass/utt, cheap).
-    Returns occ [S] (soft duration; sums roughly to T over all phones+blanks).
-    """
+    """Vectorized Per-phone occupancy on canonical sequence."""
     P, T = params.shape
     S = labels.shape[0]
     labels = labels.long()
     L = 2 * S + 1
-    logp = torch.log(params.clamp_min(1e-300))            # [P,T]
+    device = params.device
+    logp = torch.log(params.clamp_min(1e-300))  # [P, T]
     NEG = -1e30
 
-    def tok(s):                                            # token id at CTC state s
-        return blank if s % 2 == 0 else int(labels[(s - 1) // 2])
+    tok = torch.tensor([blank if s % 2 == 0 else int(labels[(s - 1) // 2]) for s in range(L)],
+                       dtype=torch.long, device=device)
 
-    la = torch.full((L, T), NEG, dtype=torch.float64)
-    lb = torch.full((L, T), NEG, dtype=torch.float64)
+    can_skip = torch.zeros(L, dtype=torch.bool, device=device)
+    if S > 1:
+        for s in range(3, L, 2):
+            if labels[(s - 1) // 2] != labels[(s - 3) // 2]:
+                can_skip[s] = True
+
+    la = torch.full((L, T), NEG, dtype=torch.float64, device=device)
+    lb = torch.full((L, T), NEG, dtype=torch.float64, device=device)
+
     la[0, 0] = logp[blank, 0]
     la[1, 0] = logp[labels[0], 0]
     for t in range(1, T):
-        for s in range(L):
-            prev = [la[s, t - 1]]
-            if s - 1 >= 0:
-                prev.append(la[s - 1, t - 1])
-            if s % 2 == 1 and s - 2 >= 0 and labels[(s - 1) // 2] != labels[(s - 3) // 2]:
-                prev.append(la[s - 2, t - 1])
-            la[s, t] = torch.logsumexp(torch.stack(prev), 0) + logp[tok(s), t]
+        v0 = la[:, t - 1]
+        v1 = F.pad(la[:-1, t - 1], (1, 0), value=NEG)
+        v2 = F.pad(la[:-2, t - 1], (2, 0), value=NEG)
+        v2 = torch.where(can_skip, v2, NEG)
+        stacked = torch.stack([v0, v1, v2], dim=0)
+        la[:, t] = torch.logsumexp(stacked, dim=0) + logp[tok, t]
 
     lb[L - 1, T - 1] = 0.0
     lb[L - 2, T - 1] = 0.0
     for t in range(T - 2, -1, -1):
-        for s in range(L):
-            nxt = [lb[s, t + 1] + logp[tok(s), t + 1]]
-            if s + 1 < L:
-                nxt.append(lb[s + 1, t + 1] + logp[tok(s + 1), t + 1])
-            if s % 2 == 1 and s + 2 < L and labels[(s - 1) // 2] != labels[(s + 1) // 2]:
-                nxt.append(lb[s + 2, t + 1] + logp[tok(s + 2), t + 1])
-            lb[s, t] = torch.logsumexp(torch.stack(nxt), 0)
+        v0 = lb[:, t + 1] + logp[tok, t + 1]
+        v1 = F.pad(lb[1:, t + 1] + logp[tok[1:], t + 1], (0, 1), value=NEG)
+        v2 = F.pad(lb[2:, t + 1] + logp[tok[2:], t + 1], (0, 2), value=NEG)
+        v2 = torch.where(can_skip, v2, NEG)
+        stacked = torch.stack([v0, v1, v2], dim=0)
+        lb[:, t] = torch.logsumexp(stacked, dim=0)
 
-    logZ = torch.logsumexp(torch.stack([la[L - 1, T - 1], la[L - 2, T - 1]]), 0)
-    gamma = torch.exp(la + lb - logZ)                     # [L,T] state posteriors
-    occ = torch.zeros(S, dtype=torch.float64)
-    for i in range(S):
-        occ[i] = gamma[2 * i + 1].sum()
+    logZ = torch.logsumexp(torch.stack([la[L - 1, T - 1], la[L - 2, T - 1]]), dim=0)
+    gamma = torch.exp(la + lb - logZ)
+    odd_idx = torch.arange(1, L, 2, device=device)
+    occ = gamma[odd_idx].sum(dim=1)
     return occ
 
 
 def extract_utt_feats_norm_fast(params, labels, blank=0, occ=True, cap_elems=4e7):
-    """
-    Same 41-d GOP-SF feature as extract_utt_feats_norm, but batches all phone
-    positions into few forward passes (chunked to respect `cap_elems` alpha
-    tensor size). Returns (feats [S,1+P], occ [S] or None).
-    """
+    """Vectorized high-throughput GOP feature-vector extraction on GPU/CPU."""
     P, T = params.shape
     S = labels.shape[0]
-    labels = labels.long()
+    device = params.device
+    labels = labels.long().to(device)
+
     nll_canon = ctc_forward_batch_norm(params, labels.view(1, -1), blank=blank)[0]
 
-    feats = torch.zeros((S, 1 + P), dtype=torch.float64)
+    feats = torch.zeros((S, 1 + P), dtype=torch.float64, device=device)
     feats[:, 0] = nll_canon
 
     per_pos = P * (2 * S + 1) * T
@@ -183,48 +119,22 @@ def extract_utt_feats_norm_fast(params, labels, blank=0, occ=True, cap_elems=4e7
     for a in range(0, S, chunk):
         b = min(S, a + chunk)
         idx = list(range(a, b))
-        # substitutions: for each pos i, labels with col i replaced by arange(P)
         seqmat = labels.view(1, -1).repeat(len(idx) * P, 1)
         for k, i in enumerate(idx):
-            seqmat[k * P:(k + 1) * P, i] = torch.arange(P)
+            seqmat[k * P:(k + 1) * P, i] = torch.arange(P, device=device)
         nll = ctc_forward_batch_norm(params, seqmat, blank=blank).view(len(idx), P)
         feats[a:b, 1:] = -nll_canon + nll
-    # deletions (all length S-1) in one batch
+
+    # Deletions (all length S-1)
     if S > 1:
-        del_seqs = torch.stack([torch.cat([labels[:i], labels[i + 1:]]) for i in range(S)])
-        nll_del = ctc_forward_batch_norm(params, del_seqs, blank=blank)
+        del_mat = torch.zeros((S, S - 1), dtype=torch.long, device=device)
+        for i in range(S):
+            del_mat[i] = torch.cat([labels[:i], labels[i + 1:]])
+        nll_del = ctc_forward_batch_norm(params, del_mat, blank=blank)
         feats[:, 1 + blank] = -nll_canon + nll_del
 
-    occ_out = canonical_occupancy(params, labels, blank=blank) if occ else None
-    return feats, occ_out
+    occ_out = None
+    if occ:
+        occ_out = canonical_occupancy(params, labels, blank=blank)
 
-
-def extract_utt_feats(params, labels, blank=0):
-    """
-    params : [P, T] float64 ; labels : [S] int (canonical ids)
-    returns: feats [S, 1+P]  (col 0 = LPP; col 1..P = LPR when replacing phone i
-             by token id (id 0 == deletion)); and lpp scalar.
-    LPR = logP(canonical) - logP(candidate).
-    """
-    P, T = params.shape
-    S = labels.shape[0]
-    labels = labels.long()
-    p_self = ctc_forward_single(params, labels, blank=blank)     # scalar prob
-    lpp = torch.log(p_self)                                       # logP(canonical) (<=0)
-
-    feats = torch.zeros((S, 1 + P), dtype=torch.float64)
-    feats[:, 0] = lpp
-    for i in range(S):
-        # substitutions: batch over all token ids at position i (includes blank slot, unused)
-        seqmat = labels.view(1, -1).repeat(P, 1)
-        seqmat[:, i] = torch.arange(P)
-        probs = ctc_forward_batch(params, seqmat, blank=blank)    # [P]
-        logp = torch.log(probs.clamp_min(1e-300))
-        lpr = lpp - logp                                          # [P]
-        # deletion for the id==blank slot
-        if S > 1:
-            del_seq = torch.cat([labels[:i], labels[i + 1:]])
-            pdel = ctc_forward_single(params, del_seq, blank=blank)
-            lpr[blank] = lpp - torch.log(pdel.clamp_min(1e-300))
-        feats[i, 1:] = lpr
-    return feats, lpp.item()
+    return feats.cpu(), (occ_out.cpu() if occ_out is not None else None)

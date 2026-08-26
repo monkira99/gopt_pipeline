@@ -2,14 +2,10 @@
 """Trích xuất đầy đủ 100% các nhóm Feature trên GPU cho Baseline GOPT tốt nhất (High-Throughput GPU Version).
 
 Tối ưu hóa:
-  1. Mô hình chạy FP16 (`torch.inference_mode()`) trên CUDA Tensor Cores (nhanh gấp 5x).
-  2. Resample âm thanh bằng PyTorch/torchaudio cực nhanh (nhanh gấp 100x librosa).
-  3. CTC Viterbi Alignment được vector hóa hoàn toàn và chỉ chạy 1 pass duy nhất per-utterance.
-
-Bộ Feature được trích xuất gồm:
-  1. KoelLabs-GOP 80-d (`feat` [N, 150, 80]) + Occupancy (`occ` [N, 150])
-  2. Prosody 8-d (`dur` [N, 150] + `eng` [N, 150, 7])
-  3. WavLM SSL (`wavlm` [N, 150, 1024] fp16)
+  1. Mô hình chạy FP16 (`torch.inference_mode()`) trên CUDA Tensor Cores.
+  2. Toàn bộ Dynamic Programming (GOP CTC Forward & Occupancy) chạy vector hóa trực tiếp trên GPU.
+  3. Resample âm thanh bằng PyTorch 1D cực nhanh (thay thế librosa).
+  4. Single-pass Viterbi Alignment dùng chung cho cả Prosody và WavLM pooling.
 """
 import argparse
 import io
@@ -36,8 +32,41 @@ from vh_gopt.core.koel_gop import map_phones_to_ids_koel
 SPLITS = ["train", "val", "test_unseen_speakers", "test_unseen_prompts"]
 
 
+def print_cuda_diagnostics(device, koel_model, wl_model=None, use_fp16=True):
+    """Kiểm tra và in chi tiết trạng thái nạp model vào GPU/CUDA."""
+    print("\n" + "=" * 65)
+    print("🔍 [CUDA DIAGNOSTICS] KIỂM TRA THIẾT BỊ VÀ TRẠNG THÁI NẠP MODEL:")
+    print("=" * 65)
+    
+    cuda_avail = torch.cuda.is_available()
+    print(f" • PyTorch version       : {torch.__version__}")
+    print(f" • CUDA khả dụng          : {'✅ CÓ (CUDA Available)' if cuda_avail else '❌ KHÔNG (Chỉ có CPU)'}")
+    
+    if cuda_avail:
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        vram_alloc = torch.cuda.memory_allocated(0) / (1024 ** 3)
+        print(f" • GPU Name              : 🚀 {gpu_name}")
+        print(f" • VRAM                  : {vram_alloc:.2f} GB / {vram_total:.2f} GB (Allocated / Total)")
+    
+    koel_dev = next(koel_model.parameters()).device
+    koel_dtype = next(koel_model.parameters()).dtype
+    print(f" • KoelLabs Acoustic CTC : Vị trí = {koel_dev} | Dtype = {koel_dtype}")
+    
+    if wl_model is not None:
+        wl_dev = next(wl_model.parameters()).device
+        wl_dtype = next(wl_model.parameters()).dtype
+        print(f" • WavLM SSL Model       : Vị trí = {wl_dev} | Dtype = {wl_dtype}")
+        
+    if device.startswith("cuda") and not cuda_avail:
+        print(" ⚠️ CẢNH BÁO: Bạn yêu cầu --device cuda nhưng PyTorch không tìm thấy GPU CUDA!")
+    else:
+        print(" ✅ Toàn bộ mô hình đã được nạp thành công vào thiết bị tính toán!")
+    print("=" * 65 + "\n")
+
+
 def fast_resample(wav_np, orig_sr, target_sr=16000):
-    """Resample waveform nhanh bằng 1D linear interpolation của PyTorch (nhanh gấp 100x librosa)."""
+    """Resample waveform cực nhanh bằng PyTorch 1D interpolation."""
     if orig_sr == target_sr:
         return wav_np.astype(np.float32)
     t_wav = torch.from_numpy(wav_np).float().view(1, 1, -1)
@@ -70,7 +99,7 @@ def extract_split_features(split_name, ds_split, out_path,
                            device="cuda", limit=0, max_len=150,
                            use_wavlm=True, use_prosody=True, use_fp16=True):
     N = len(ds_split) if limit == 0 else min(limit, len(ds_split))
-    print(f"\n============================================================")
+    print(f"============================================================")
     print(f"--- TRÍCH XUẤT FEATURE: {split_name} ({N:,} mẫu) -> {out_path} ---")
     print(f"============================================================")
 
@@ -143,9 +172,9 @@ def extract_split_features(split_name, ds_split, out_path,
             wav_data = fast_resample(wav_data, sr, 16000)
 
         labels_koel, _ = map_phones_to_ids_koel(canon_phones, koel_processor.tokenizer)
-        labels_t = torch.tensor(labels_koel, dtype=torch.long)
+        labels_t = torch.tensor(labels_koel, dtype=torch.long, device=device)
 
-        # ---- 1. KOELLABS CTC FORWARD ----
+        # ---- 1. KOELLABS CTC FORWARD & GPU GOP EXTRACTION ----
         iv = koel_processor(wav_data, sampling_rate=16000, return_tensors="pt").input_values.to(device)
         if use_fp16 and device.startswith("cuda"):
             iv = iv.half()
@@ -153,7 +182,8 @@ def extract_split_features(split_name, ds_split, out_path,
         with torch.inference_mode():
             koel_logits = koel_model(iv).logits[0]  # [T, 80]
 
-        post = torch.softmax(koel_logits.float(), dim=-1).cpu().type(torch.float64).T  # [P, T]
+        # GOP Dynamic programming chạy trực tiếp trên GPU:
+        post = torch.softmax(koel_logits.float(), dim=-1).type(torch.float64).T  # [P, T] trên GPU
         gop_res, occ_res = extract_utt_feats_norm_fast(post, labels_t, blank=blank_id, occ=True)
         feat[i, :S] = gop_res.numpy()[:S]
         if occ_res is not None:
@@ -163,7 +193,8 @@ def extract_split_features(split_name, ds_split, out_path,
         logp = koel_logits.float().log_softmax(-1).cpu().double()  # [T, C]
         segs, T_ctc = None, None
         if S > 0 and (use_prosody or (use_wavlm and wl_model is not None)):
-            segs, T_ctc, _ = phone_segments(logp, labels_t, blank=blank_id)
+            labels_cpu = labels_t.cpu()
+            segs, T_ctc, _ = phone_segments(logp, labels_cpu, blank=blank_id)
 
         if use_prosody and S > 0 and segs is not None:
             d_res, e_res = phone_prosody_from_segs(segs, T_ctc, wav_data, S)
@@ -228,7 +259,7 @@ def extract_split_features(split_name, ds_split, out_path,
     np.savez_compressed(out_path, **save_dict)
     dt = time.time() - t0
     size_mb = os.path.getsize(out_path) / 1e6
-    print(f">> HOÀN TẤT {split_name}: {N} mẫu | {size_mb:.1f} MB | {dt:.1f}s ({dt/max(N,1):.2f}s/utt) -> {out_path}")
+    print(f">> HOÀN TẤT {split_name}: {N} mẫu | {size_mb:.1f} MB | {dt:.1f}s ({dt/max(N,1):.2f}s/utt) -> {out_path}\n")
 
 
 def push_extracted_features_to_hub(npz_dir, splits, repo, public=False):
@@ -363,10 +394,9 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     use_fp16 = not args.no_fp16 and args.device.startswith("cuda")
 
-    print(f"Thiết bị tính toán: {args.device} (FP16={use_fp16})")
-
     ds = load_input_dataset(args, cfg)
 
+    # 1. Nạp Acoustic Model (KoelLabs CTC)
     from transformers import AutoModelForCTC, AutoProcessor
     print(f"\n[1/2] Nạp Acoustic Model: {args.acoustic_model} ...")
     koel_proc = AutoProcessor.from_pretrained(args.acoustic_model)
@@ -375,6 +405,7 @@ def main():
         koel_model = koel_model.half()
     blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
 
+    # 2. Nạp WavLM Model (nếu bật)
     wl_model, wl_fe = None, None
     use_wavlm = not args.no_wavlm
     if use_wavlm:
@@ -385,6 +416,10 @@ def main():
         if use_fp16:
             wl_model = wl_model.half()
 
+    # 3. In bảng kiểm tra CUDA Diagnostics
+    print_cuda_diagnostics(args.device, koel_model, wl_model, use_fp16)
+
+    # 4. Trích xuất Feature
     for s in splits:
         if s not in ds:
             print(f"[SKIP] Không tìm thấy split '{s}' trong dataset")
@@ -411,7 +446,7 @@ def main():
     print("\n============================================================")
     print(f"TRÍCH XUẤT TOÀN BỘ FEATURE HOÀN TẤT! File .npz sẵn sàng tại: {out_dir}")
     print("Có thể chạy huấn luyện ngay:")
-    print(f"  ./run.sh train --train {out_dir}/train.npz --test {out_dir}/test_unseen_speakers.npz --epochs 80 --use-wavlm --wavlm-fuse stack --wavlm-dim 32 --utt-prosody")
+    print(f"  ./run.sh train-stage2 --config configs/stage2/baseline_wavlm32.yaml")
     print("============================================================")
 
     if args.push_repo:
