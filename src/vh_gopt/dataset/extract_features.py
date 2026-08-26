@@ -10,6 +10,7 @@ import argparse
 import io
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +27,7 @@ from vh_gopt.core import (
     phone_prosody_from_segs,
     phone_segments,
 )
-from vh_gopt.core.gop_feats_fast import extract_utt_feats_norm_fast
+from vh_gopt.core.gop_feats_fast import extract_utt_feats_fb, extract_utt_feats_norm_fast
 from vh_gopt.core.koel_gop import map_phones_to_ids_koel
 
 SPLITS = ["train", "val", "test_unseen_speakers", "test_unseen_prompts"]
@@ -161,9 +162,18 @@ def extract_split_features(split_name, ds_split, out_path,
                            wl_model, wl_fe, wl_layer,
                            device="cuda", limit=0, max_len=150,
                            use_wavlm=True, use_prosody=True, use_fp16=True,
-                           batch_size=16, num_workers=2):
+                           batch_size=16, num_workers=2, phase3_workers=0):
     dataset = AudioExtractionDataset(ds_split, limit=limit, max_len=max_len)
     N = len(dataset)
+
+    # CPU Phase-3 parallelism: each utterance's GOP/align/pool is independent and
+    # writes to a distinct row, so a thread pool scales it across cores. Cap torch
+    # intra-op threads to 1 so the pool (not BLAS) owns the parallelism (no oversub).
+    if phase3_workers <= 0:
+        phase3_workers = min(batch_size, max(1, (os.cpu_count() or 2)))
+    phase3_pool = ThreadPoolExecutor(max_workers=phase3_workers) if phase3_workers > 1 else None
+    if phase3_workers > 1:
+        torch.set_num_threads(1)
     print(f"============================================================")
     print(f"--- TRÍCH XUẤT FEATURE: {split_name} ({N:,} mẫu | Batch Size = {batch_size}) -> {out_path} ---")
     print(f"============================================================")
@@ -258,81 +268,86 @@ def extract_split_features(split_name, ds_split, out_path,
             sync_cuda(device)
             prof["wavlm_fwd"] += (time.time() - t_w0)
 
-        # ---- PHASE 3: VECTORIZED GPU GOP & ALIGNMENT PROCESSING ----
-        for b in range(B):
+        # ---- TRANSFER: batch neural outputs GPU -> CPU once (single sync each) ----
+        # GOP DP is a small sequential per-phone recurrence; it runs FASTER on CPU
+        # (no kernel-launch / host-sync overhead) and frees the GPU for the next
+        # batch's neural forward. Per-utt work is then pure CPU -> parallelize across
+        # cores. Bulk-transferring here avoids a GPU sync on every utterance.
+        t_tx0 = time.time()
+        batch_koel_logits_cpu = batch_koel_logits.float().cpu()
+        batch_wl_hs_cpu = batch_wl_hs.float().cpu() if batch_wl_hs is not None else None
+        prof["data_wait"] += (time.time() - t_tx0)
+
+        koel_out_len = getattr(koel_model, "_get_feat_extract_output_lengths", None)
+        wl_out_len = getattr(wl_model, "_get_feat_extract_output_lengths", None) if wl_model is not None else None
+
+        # ---- PHASE 3: CPU GOP (forward-backward) + alignment + WavLM pool ----
+        def _proc_utt(b):
             item = batch[b]
             i = curr_idx + b
-            rid = item["id"]
-            ids_list[i] = rid
+            ids_list[i] = item["id"]
             texts_list[i] = item["text"]
-
             phn[i] = item["phn"]
             phone_label[i] = item["phone_label"]
             phone_weight[i] = item["phone_weight"]
             n_vendors[i] = item["n_vendors"]
-
             word_id[i] = item["word_id"]
             word_acc[i] = item["word_acc"]
             word_weight[i] = item["word_weight"]
-
             utt_label[i] = item["utt_label"]
             utt_weight[i] = item["utt_weight"]
             utt_nv[i] = item["utt_nv"]
-
             msdd_type[i] = item["msdd_type"]
             msdd_sub[i] = item["msdd_sub"]
 
             canon_phones = item["canon_phones"]
             S = len(canon_phones)
             wav_data = item["wav"]
-            if hasattr(koel_model, "_get_feat_extract_output_lengths"):
-                T_actual = int(koel_model._get_feat_extract_output_lengths(torch.tensor(len(wav_data))).item())
+            if koel_out_len is not None:
+                T_actual = int(koel_out_len(torch.tensor(len(wav_data))).item())
             else:
                 T_actual = max(1, int(len(wav_data) // 320))
+            if S <= 0:
+                return
 
-            if S > 0:
-                labels_koel, _ = map_phones_to_ids_koel(canon_phones, koel_processor.tokenizer)
-                labels_t = torch.tensor(labels_koel, dtype=torch.long, device=device)
-                koel_logits = batch_koel_logits[b, :T_actual]
+            labels_koel, _ = map_phones_to_ids_koel(canon_phones, koel_processor.tokenizer)
+            labels_cpu = torch.tensor(labels_koel, dtype=torch.long)
+            koel_logits = batch_koel_logits_cpu[b, :T_actual]  # CPU fp32
 
-                # 3A. GOP Dynamic Programming
-                sync_cuda(device)
-                t_g0 = time.time()
-                post = torch.softmax(koel_logits.float(), dim=-1).T
-                gop_res, occ_res = extract_utt_feats_norm_fast(post, labels_t, blank=blank_id, occ=False)
-                feat[i, :S] = gop_res.numpy()[:S]
-                if occ_res is not None:
-                    occ[i, :S] = occ_res.numpy()[:S]
-                sync_cuda(device)
-                prof["gop_dp"] += (time.time() - t_g0)
-                # 3B. Single-pass Viterbi Alignment & Prosody
-                t_a0 = time.time()
-                logp = koel_logits.float().log_softmax(-1).cpu().float()
-                labels_cpu = labels_t.cpu()
-                segs, T_ctc, _ = phone_segments(logp, labels_cpu, blank=blank_id)
+            # 3A. GOP forward-backward (CPU)
+            post = torch.softmax(koel_logits, dim=-1).T
+            gop_res, occ_res = extract_utt_feats_fb(post, labels_cpu, blank=blank_id)
+            feat[i, :S] = gop_res.numpy()[:S]
+            if occ_res is not None:
+                occ[i, :S] = occ_res.numpy()[:S]
 
-                if use_prosody and segs is not None:
-                    d_res, e_res = phone_prosody_from_segs(segs, T_ctc, wav_data, S)
-                    dur[i, :S] = d_res[:S]
-                    eng[i, :S] = e_res[:S]
-                prof["alignment_prosody"] += (time.time() - t_a0)
+            # 3B. Viterbi alignment & prosody (CPU)
+            logp = koel_logits.log_softmax(-1)
+            segs, T_ctc, _ = phone_segments(logp, labels_cpu, blank=blank_id)
+            if use_prosody and segs is not None:
+                d_res, e_res = phone_prosody_from_segs(segs, T_ctc, wav_data, S)
+                dur[i, :S] = d_res[:S]
+                eng[i, :S] = e_res[:S]
 
-                # 3C. WavLM Mean-Pooling
-                if use_wavlm and batch_wl_hs is not None and segs is not None:
-                    t_p0 = time.time()
-                    if hasattr(wl_model, "_get_feat_extract_output_lengths"):
-                        Tw_actual = int(wl_model._get_feat_extract_output_lengths(torch.tensor(len(wav_data))).item())
-                    else:
-                        Tw_actual = T_actual
-                    hs = batch_wl_hs[b, :Tw_actual].float().cpu()  # [Tw, 1024]
-                    Tw = hs.shape[0]
-                    ratio = Tw / max(T_ctc, 1)
-                    for k, (a, b_seg) in enumerate(segs):
-                        if k >= max_len:
-                            break
-                        a2, b2 = int(a * ratio), max(int(b_seg * ratio), int(a * ratio) + 1)
-                        wavlm[i, k] = hs[a2:min(b2, Tw)].mean(0).numpy().astype(np.float16)
-                    prof["wavlm_pool"] += (time.time() - t_p0)
+            # 3C. WavLM mean-pooling per phone (CPU)
+            if use_wavlm and batch_wl_hs_cpu is not None and segs is not None:
+                Tw_actual = int(wl_out_len(torch.tensor(len(wav_data))).item()) if wl_out_len is not None else T_actual
+                hs = batch_wl_hs_cpu[b, :Tw_actual]  # [Tw, 1024]
+                Tw = hs.shape[0]
+                ratio = Tw / max(T_ctc, 1)
+                for k, (a, b_seg) in enumerate(segs):
+                    if k >= max_len:
+                        break
+                    a2, b2 = int(a * ratio), max(int(b_seg * ratio), int(a * ratio) + 1)
+                    wavlm[i, k] = hs[a2:min(b2, Tw)].mean(0).numpy().astype(np.float16)
+
+        t_g0 = time.time()
+        if phase3_workers > 1 and B > 1:
+            list(phase3_pool.map(_proc_utt, range(B)))
+        else:
+            for b in range(B):
+                _proc_utt(b)
+        prof["gop_dp"] += (time.time() - t_g0)
 
         curr_idx += B
         prof["total_utt_count"] += B
@@ -362,6 +377,8 @@ def extract_split_features(split_name, ds_split, out_path,
         t_data_start = time.time()
 
     pbar.close()
+    if phase3_pool is not None:
+        phase3_pool.shutdown(wait=True)
     out_dir = Path(out_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -523,6 +540,7 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     ap.add_argument("--batch-size", type=int, default=16, help="Batch size chạy GPU (mặc định: 16)")
     ap.add_argument("--num-workers", type=int, default=2, help="Số worker CPU giải mã âm thanh (Colab tối ưu = 2)")
+    ap.add_argument("--phase3-workers", type=int, default=0, help="Số thread CPU chạy song song GOP-DP/align/pool mỗi batch (0 = auto min(batch,cpu_count))")
     ap.add_argument("--no-fp16", action="store_true", help="Tắt chế độ FP16 trên GPU")
     ap.add_argument("--no-wavlm", action="store_true", help="Bỏ qua trích xuất WavLM")
     ap.add_argument("--no-prosody", action="store_true", help="Bỏ qua trích xuất Prosody")
@@ -598,6 +616,7 @@ def main():
             use_fp16=use_fp16,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            phase3_workers=args.phase3_workers,
         )
 
     print("\n============================================================")
