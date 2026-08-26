@@ -1,0 +1,10 @@
+# Runtime deps (khop pyproject.toml). Cai dat: pip install -e .
+numpy
+torch
+transformers
+soundfile
+librosa
+tqdm
+huggingface_hub
+datasets
+g2p_en

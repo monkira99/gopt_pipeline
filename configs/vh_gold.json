@@ -1,0 +1,9 @@
+{
+  "corpus_dir": "data/corpus",
+  "out_dir": "data/gopt_vh_scripted_gold",
+  "model_id": "KoelLabs/xlsr-english-01",
+  "device": "cpu",
+  "max_len": 150,
+  "hf_corpus_repo": null,
+  "hf_dataset_repo": null
+}

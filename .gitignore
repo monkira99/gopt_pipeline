@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+
+# Du lieu va artifact trung gian - khong commit
+data/
+cache/
+out/
+*.npz
+*.arrow
