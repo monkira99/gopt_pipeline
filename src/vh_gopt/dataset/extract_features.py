@@ -314,10 +314,13 @@ def extract_split_features(split_name, ds_split, out_path,
 
                 # 3C. WavLM Mean-Pooling
                 if use_wavlm and batch_wl_hs is not None and segs is not None:
+                    t_p0 = time.time()
                     if hasattr(wl_model, "_get_feat_extract_output_lengths"):
                         Tw_actual = int(wl_model._get_feat_extract_output_lengths(torch.tensor(len(wav_data))).item())
                     else:
                         Tw_actual = T_actual
+                    hs = batch_wl_hs[b, :Tw_actual].float().cpu()  # [Tw, 1024]
+                    Tw = hs.shape[0]
                     ratio = Tw / max(T_ctc, 1)
                     for k, (a, b_seg) in enumerate(segs):
                         if k >= max_len:
