@@ -278,10 +278,9 @@ def compute_metrics(ep):
     # word: aggregate to word level by word_id (channel -1)
     wp, wt = _agg_word(word_p, word_l[..., :len(WORD_HEADS)], word_l[..., -1])
     for j, name in enumerate(WORD_HEADS):
-        m[f"word_{name}"] = pcc(wp[:, j], wt[:, j])
+        m[f"word_{name}"] = pcc(wp[:, j], wt[:, j], mask=(wt[:, j] >= 0))
     for j, name in enumerate(UTT_HEADS):
-        m[f"utt_{name}"] = pcc(utt_p[:, j], utt_l[:, j])
-    # completeness kept as an auxiliary training head but excluded from `mean`: its label is
+        m[f"utt_{name}"] = pcc(utt_p[:, j], utt_l[:, j], mask=(utt_l[:, j] >= 0))
     # near-constant on SO762 so its PCC is unstable/uninformative (see gopt_model.MEAN_HEADS).
     skip = {f"utt_{h}" for h in UTT_HEADS if h not in MEAN_HEADS}
     head_vals = {k: v for k, v in m.items() if k not in skip}          # 6 head: phone, word_*, utt_*
@@ -294,64 +293,73 @@ def compute_metrics(ep):
     return m
 
 
+def flatten_dict(d):
+    flat = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                flat[sub_k.replace("-", "_")] = sub_v
+        else:
+            flat[k.replace("-", "_")] = v
+    return flat
+
+
 def main():
+    pre_p = argparse.ArgumentParser(add_help=False)
+    pre_p.add_argument("--config", default=None)
+    pre_args, _ = pre_p.parse_known_args()
+
+    cfg = {}
+    if pre_args.config and os.path.exists(pre_args.config):
+        from vh_gopt.config import load_config_file
+        cfg = flatten_dict(load_config_file(pre_args.config))
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train", default="data/gopt/train.npz")
-    ap.add_argument("--test", default="data/gopt/test.npz")
-    ap.add_argument("--epochs", type=int, default=80)
-    ap.add_argument("--bs", type=int, default=25)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--wd", type=float, default=5e-7)          # GOPT weight_decay
-    ap.add_argument("--embed-dim", type=int, default=24)       # GOPT paper best
-    ap.add_argument("--heads", type=int, default=1)
-    ap.add_argument("--depth", type=int, default=3)
-    ap.add_argument("--model", choices=["gopt", "hia"], default="gopt",
+    ap.add_argument("--config", default=pre_args.config, help="Path to YAML/JSON experiment config")
+    ap.add_argument("--train", default=cfg.get("train", "data/gopt_vh_scripted_gold/train.npz"))
+    ap.add_argument("--test", default=cfg.get("test", "data/gopt_vh_scripted_gold/test_unseen_speakers.npz"))
+    ap.add_argument("--epochs", type=int, default=cfg.get("epochs", 80))
+    ap.add_argument("--bs", type=int, default=cfg.get("bs", 25))
+    ap.add_argument("--lr", type=float, default=cfg.get("lr", 1e-3))
+    ap.add_argument("--wd", type=float, default=cfg.get("wd", 5e-7))
+    ap.add_argument("--embed-dim", type=int, default=cfg.get("embed_dim", 24))
+    ap.add_argument("--heads", type=int, default=cfg.get("heads", 1))
+    ap.add_argument("--depth", type=int, default=cfg.get("depth", 3))
+    ap.add_argument("--model", choices=["gopt", "hia"], default=cfg.get("model", "gopt"),
                     help="hia = Residual Hierarchical Interactive Attention (arXiv:2601.01745)")
-    ap.add_argument("--arch", choices=["base", "mlp", "concat", "film"], default="base",
+    ap.add_argument("--arch", choices=["base", "mlp", "concat", "film"], default=cfg.get("arch", "base"),
                     help="(gopt only) phone-conditioning / input projection variant")
-    ap.add_argument("--phono", action="store_true", help="JCAPT phonological attr features")
-    ap.add_argument("--think", type=int, default=0, help="JCAPT think tokens (0=off)")
-    ap.add_argument("--attn-pool", action="store_true", help="JCAPT per-aspect attention pooling for utt")
-    ap.add_argument("--dropout", type=float, default=0.1)     # 0.1 beats GOPT's 0 on our features
-    ap.add_argument("--sched", choices=["gopt", "cosine"], default="cosine",
-                    help="cosine wins here; gopt = MultiStepLR halve every 5 ep after ep20 (paper)")
-    ap.add_argument("--balanced", action="store_true", help="score-balanced loss for label skew")
-    ap.add_argument("--balance-heads", choices=["all", "phn"], default="phn",
-                    help="phn = balance phone/word only (utt stays plain mean)")
-    ap.add_argument("--bins", type=int, default=10)
-    ap.add_argument("--beta", type=float, default=0.999)
-    ap.add_argument("--wcap", type=float, default=5.0)
-    ap.add_argument("--gop-map", default="arpa", choices=["arpa", "koel"],
-                    help="ghi vào config để inference biết cách map âm: arpa (./model) | koel (Path-A GOP-79d)")
-    ap.add_argument("--acoustic-model", default="./model",
-                    help="đường dẫn acoustic model dùng khi trích GOP (ghi vào config cho inference)")
-    ap.add_argument("--use-occ", action="store_true", help="add occupancy as 42nd feature dim")
-    ap.add_argument("--use-prosody", action="store_true", help="3M duration+energy (8d) into encoder (all heads)")
-    ap.add_argument("--utt-prosody", action=argparse.BooleanOptionalAction, default=True,
-                    help="3M duration+energy (8d) into utterance branch ONLY (new baseline, default on; "
-                         "--no-utt-prosody to disable). Needs dur/eng in npz (run add_prosody.py).")
-    ap.add_argument("--use-wavlm", action="store_true",
-                    help="fuse WavLM SSL feature (pooled/phone, PCA) vào encoder. Cần add_wavlm.py trước")
-    ap.add_argument("--wavlm-dim", type=int, default=128, help="chiều PCA giảm cho WavLM (mặc định 128)")
-    ap.add_argument("--wavlm-fuse", choices=["stack", "phone", "utt"], default="stack",
-                    help="cách fuse WavLM: stack=nhồi chung core (cũ); phone=projection riêng cộng vào token phone; "
-                         "utt=pool projection riêng CHỈ vào nhánh utt (phone thuần GOP)")
-    ap.add_argument("--best-metric", choices=["mean", "phone", "phone_heavy"], default="mean",
-                    help="tiêu chí chọn best checkpoint: mean=trung bình 6 head (cũ); phone=chỉ phone; "
-                         "phone_heavy=mean nghiêng phone (phone nhân --phone-weight)")
-    ap.add_argument("--phone-weight", type=float, default=2.0,
-                    help="trọng số phone trong metric phone_heavy (mặc định 2.0)")
-    ap.add_argument("--noise", type=float, default=0.0)        # GOPT input aug
-    ap.add_argument("--w-phn", type=float, default=1.0)
-    ap.add_argument("--w-word", type=float, default=1.0)
-    ap.add_argument("--w-utt", type=float, default=1.0)
-    ap.add_argument("--out", default="ckpt/gopt")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--wandb-project", default="gop-ctc-gopt")
-    ap.add_argument("--wandb-run", default=None)
-    ap.add_argument("--no-wandb", action="store_true")
-    ap.add_argument("--push-model", action="store_true")
-    ap.add_argument("--hf-repo", default=None, help="e.g. gopt-ctc-gop (namespace auto)")
+    ap.add_argument("--phono", action="store_true", default=cfg.get("phono", False))
+    ap.add_argument("--think", type=int, default=cfg.get("think", 0))
+    ap.add_argument("--attn-pool", action="store_true", default=cfg.get("attn_pool", False))
+    ap.add_argument("--dropout", type=float, default=cfg.get("dropout", 0.20))
+    ap.add_argument("--sched", choices=["gopt", "cosine"], default=cfg.get("sched", "cosine"))
+    ap.add_argument("--balanced", action="store_true", default=cfg.get("balanced", False))
+    ap.add_argument("--balance-heads", choices=["all", "phn"], default=cfg.get("balance_heads", "phn"))
+    ap.add_argument("--bins", type=int, default=cfg.get("bins", 10))
+    ap.add_argument("--beta", type=float, default=cfg.get("beta", 0.999))
+    ap.add_argument("--wcap", type=float, default=cfg.get("wcap", 5.0))
+    ap.add_argument("--gop-map", default=cfg.get("gop_map", "koel"), choices=["arpa", "koel"])
+    ap.add_argument("--acoustic-model", default=cfg.get("acoustic_model", "KoelLabs/xlsr-english-01"))
+    ap.add_argument("--use-occ", action="store_true", default=cfg.get("use_occ", False))
+    ap.add_argument("--use-prosody", action="store_true", default=cfg.get("use_prosody", False))
+    ap.add_argument("--utt-prosody", action=argparse.BooleanOptionalAction, default=cfg.get("utt_prosody", True))
+    ap.add_argument("--use-wavlm", action="store_true", default=cfg.get("use_wavlm", True))
+    ap.add_argument("--wavlm-dim", type=int, default=cfg.get("wavlm_dim", 32))
+    ap.add_argument("--wavlm-fuse", choices=["stack", "phone", "utt"], default=cfg.get("wavlm_fuse", "stack"))
+    ap.add_argument("--best-metric", choices=["mean", "phone", "phone_heavy"], default=cfg.get("best_metric", "mean"))
+    ap.add_argument("--phone-weight", type=float, default=cfg.get("phone_weight", 2.0))
+    ap.add_argument("--noise", type=float, default=cfg.get("noise", 0.10))
+    ap.add_argument("--w-phn", type=float, default=cfg.get("w_phn", 1.0))
+    ap.add_argument("--w-word", type=float, default=cfg.get("w_word", 1.0))
+    ap.add_argument("--w-utt", type=float, default=cfg.get("w_utt", 1.0))
+    ap.add_argument("--out", default=cfg.get("out", "ckpt/stage2_baseline_wavlm32"))
+    ap.add_argument("--seed", type=int, default=cfg.get("seed", 0))
+    ap.add_argument("--wandb-project", default=cfg.get("wandb_project", "gop-ctc-gopt"))
+    ap.add_argument("--wandb-run", default=cfg.get("wandb_run", None))
+    ap.add_argument("--no-wandb", action="store_true", default=cfg.get("no_wandb", False))
+    ap.add_argument("--push-model", action="store_true", default=cfg.get("push_model", False))
+    ap.add_argument("--hf-repo", default=cfg.get("hf_repo", None))
     args = ap.parse_args()
     global PHONE_W
     PHONE_W = args.phone_weight
@@ -512,7 +520,10 @@ def _write_config(args, best, tr):
     if args.use_prosody or args.utt_prosody:
         cfg["pros_norm"] = {"mean": tr.pros_mean, "std": tr.pros_std}
     json.dump(cfg, open(os.path.join(args.out, "config.json"), "w"), indent=2)
-
+    with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(best, f, indent=2)
+    from vh_gopt.config import save_config
+    save_config(vars(args), os.path.join(args.out, "config.yaml"))
 
 def _push(ckpt_dir, repo, best):
     from huggingface_hub import HfApi

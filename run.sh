@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Dispatcher for vh-gopt pipeline (UV-native / virtualenv).
-#   ./run.sh install                    # cai dat package editable (uv pip install -e .)
-#   ./run.sh snapshot [flags...]        # (may co du lieu thoi) tao + push corpus snapshot len HF
-#   ./run.sh fetch    [flags...]        # (server build) tai corpus snapshot tu HF
-#   ./run.sh pack     [flags...]        # corpus -> 4 npz (mac dinh trich GOP 80-d; --skip-gop de nhan-only)
-#   ./run.sh verify   [flags...]        # cong chat luong truoc khi push
-#   ./run.sh push     [flags...]        # npz -> datasets.DatasetDict -> HF Hub (--dry-run de thu conversion)
-#   ./run.sh build    [flags...]        # npz nhan + audio -> GOLD Arrow (audio+labels, load_dataset duoc); --repo de push
-#   ./run.sh extract  [flags...]        # (server GPU) trich day du Feature: KoelLabs 80-d + Prosody 8-d + WavLM 1024-d -> 4 .npz
-#   ./run.sh train    [flags...]        # train GOPT/HIA tren npz trung gian
+#   ./run.sh install                         # cai dat package editable (uv pip install -e .)
+#   ./run.sh snapshot [flags...]             # (may co du lieu thoi) tao + push corpus snapshot len HF
+#   ./run.sh fetch    [flags...]             # (server build) tai corpus snapshot tu HF
+#   ./run.sh pack     [flags...]             # corpus -> 4 npz (mac dinh trich GOP 80-d; --skip-gop de nhan-only)
+#   ./run.sh verify   [flags...]             # cong chat luong truoc khi push
+#   ./run.sh push     [flags...]             # npz -> datasets.DatasetDict -> HF Hub
+#   ./run.sh build    [flags...]             # npz nhan + audio -> GOLD Arrow (audio+labels, load_dataset duoc); --repo de push
+#   ./run.sh extract  [flags...]             # (server GPU) trich Feature: KoelLabs 80d + Prosody 8d + WavLM 1024d -> 4 .npz
+#   ./run.sh train-stage1 --config <file>    # Train Stage 1: Chan doan loi am vi (MSDD / MDD)
+#   ./run.sh train-stage2 --config <file>    # Train Stage 2: Cham diem da khia canh (GOPT / HIA)
+#   ./run.sh train        --config <file>    # Alias cua train-stage2
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -36,14 +38,16 @@ case "$cmd" in
       "${RUNNER[@]}" -m pip install -e "$ROOT"
     fi
     ;;
-  snapshot) "${RUNNER[@]}" -m vh_gopt.dataset.snapshot_corpus "$@" ;;
-  fetch)    "${RUNNER[@]}" -m vh_gopt.dataset.fetch_corpus "$@" ;;
-  pack)     "${RUNNER[@]}" -m vh_gopt.dataset.pack_stage2 "$@" ;;
-  verify)   "${RUNNER[@]}" -m vh_gopt.dataset.verify_dataset "$@" ;;
-  push)     "${RUNNER[@]}" -m vh_gopt.dataset.push_dataset "$@" ;;
-  build)    "${RUNNER[@]}" -m vh_gopt.dataset.build_gold_arrow "$@" ;;
-  extract)  "${RUNNER[@]}" -m vh_gopt.dataset.extract_features "$@" ;;
-  train)    "${RUNNER[@]}" -m vh_gopt.training.gopt_train "$@" ;;
+  snapshot)     "${RUNNER[@]}" -m vh_gopt.dataset.snapshot_corpus "$@" ;;
+  fetch)        "${RUNNER[@]}" -m vh_gopt.dataset.fetch_corpus "$@" ;;
+  pack)         "${RUNNER[@]}" -m vh_gopt.dataset.pack_stage2 "$@" ;;
+  verify)       "${RUNNER[@]}" -m vh_gopt.dataset.verify_dataset "$@" ;;
+  push)         "${RUNNER[@]}" -m vh_gopt.dataset.push_dataset "$@" ;;
+  build)        "${RUNNER[@]}" -m vh_gopt.dataset.build_gold_arrow "$@" ;;
+  extract)      "${RUNNER[@]}" -m vh_gopt.dataset.extract_features "$@" ;;
+  train-stage1) "${RUNNER[@]}" -m vh_gopt.training.stage1_mdd_train "$@" ;;
+  train-stage2) "${RUNNER[@]}" -m vh_gopt.training.gopt_train "$@" ;;
+  train)        "${RUNNER[@]}" -m vh_gopt.training.gopt_train "$@" ;;
   *)
     grep '^#   ' "$0" | sed 's/^# *//'
     exit 1 ;;

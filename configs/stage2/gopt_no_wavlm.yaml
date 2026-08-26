@@ -1,0 +1,46 @@
+# ============================================================================
+# Stage 2: Ablation (KoelLabs-80d without WavLM)
+# ============================================================================
+
+experiment_name: "stage2_gopt_no_wavlm"
+
+dataset:
+  train: "data/gopt_vh_scripted_gold/train.npz"
+  test: "data/gopt_vh_scripted_gold/test_unseen_speakers.npz"
+  val: "data/gopt_vh_scripted_gold/val.npz"
+  scale: "0-100"
+
+features:
+  acoustic_model: "KoelLabs/xlsr-english-01"
+  gop_map: "koel"
+  use_occ: false
+  use_prosody: false
+  utt_prosody: true
+  use_wavlm: false
+
+model:
+  model: "gopt"
+  arch: "base"
+  embed_dim: 24
+  depth: 3
+  heads: 1
+  dropout: 0.10
+  noise: 0.0
+
+training:
+  epochs: 80
+  bs: 25
+  lr: 0.001
+  wd: 0.0001
+  sched: "cosine"
+  w_phn: 1.0
+  w_word: 1.0
+  w_utt: 1.0
+  best_metric: "mean"
+  seed: 0
+
+logging:
+  out: "ckpt/stage2_gopt_no_wavlm"
+  wandb_project: "gopt-vh-experiments"
+  wandb_run: "stage2-gopt-no-wavlm"
+  no_wandb: false

@@ -1,0 +1,27 @@
+# ============================================================================
+# Stage 1: Phoneme Mispronunciation Detection & Diagnosis (MSDD Baseline)
+# ============================================================================
+
+experiment_name: "stage1_msdd_baseline"
+
+dataset:
+  train: "data/gopt_vh_scripted_gold/train.npz"
+  test: "data/gopt_vh_scripted_gold/test_unseen_speakers.npz"
+  max_len: 150
+
+model:
+  embed_dim: 64
+  depth: 3
+  heads: 4
+  dropout: 0.10
+
+training:
+  epochs: 40
+  bs: 32
+  lr: 0.0005
+  wd: 0.0001
+  w_det: 1.0       # Trọng số loss Detection (3-class: OK / Sub / Del)
+  w_diag: 1.0      # Trọng số loss Diagnosis (39-class ARPA target)
+
+logging:
+  out: "ckpt/stage1_msdd_baseline"
