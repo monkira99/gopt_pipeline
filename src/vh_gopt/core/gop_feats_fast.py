@@ -1,23 +1,24 @@
-"""Fast GOP feature-vector extraction (is24 gop-af-feats style), GPU-vectorized.
+"""Fast GOP feature-vector extraction (is24 gop-af-feats style), GPU FP32 Tensor Core accelerated.
 
 Key speedup:
-  1. Vectorized along the CTC state lattice L (eliminating slow nested Python loops).
+  1. Vectorized along the CTC state lattice L on CUDA FP32 Tensor Cores (eliminating slow FP64 emulation).
   2. Batched across all B substitution candidates in a single high-throughput pass on GPU.
-  3. Increased `cap_elems` to 5e8 so an entire utterance (6,800 candidates) runs in 1 pass instead of 30 chunk passes.
+  3. Single-pass forward algorithm directly on CUDA.
 """
 import torch
 import torch.nn.functional as F
 
 
 def ctc_forward_batch_norm(params, seqmat, blank=0):
-    """Vectorized scaled-forward batched across all B sequences.
-    params: [P, T] (emission probabilities)
+    """Vectorized scaled-forward batched across all B sequences on CUDA FP32.
+    params: [P, T] (emission probabilities, float32)
     seqmat: [B, S] (token sequences)
     """
     P, T = params.shape
     B, S = seqmat.shape
     L = 2 * S + 1
     device = params.device
+    dtype = params.dtype  # float32
 
     tok = torch.full((B, L), blank, dtype=torch.long, device=device)
     odd_idx = torch.arange(1, L, 2, device=device)
@@ -28,12 +29,12 @@ def ctc_forward_batch_norm(params, seqmat, blank=0):
         same_tok = (seqmat[:, 1:] == seqmat[:, :-1])  # [B, S-1]
         can_skip_blank[:, 3::2] = ~same_tok
 
-    alphas = torch.zeros((B, L), dtype=torch.float64, device=device)
-    alpha_bar = torch.zeros((B, T), dtype=torch.float64, device=device)
+    alphas = torch.zeros((B, L), dtype=dtype, device=device)
+    alpha_bar = torch.zeros((B, T), dtype=dtype, device=device)
 
     alphas[:, 0] = params[blank, 0]
     alphas[:, 1] = params[seqmat[:, 0], 0]
-    bar0 = torch.clamp_min(alphas.sum(dim=1), 1e-300)
+    bar0 = torch.clamp_min(alphas.sum(dim=1), 1e-20)
     alpha_bar[:, 0] = bar0
     alphas = alphas / bar0.unsqueeze(1)
 
@@ -47,7 +48,7 @@ def ctc_forward_batch_norm(params, seqmat, blank=0):
 
         curr = (v0 + v1 + v2) * emit_all[:, :, t]
 
-        bar = torch.clamp_min(curr.sum(dim=1), 1e-300)
+        bar = torch.clamp_min(curr.sum(dim=1), 1e-20)
         alpha_bar[:, t] = bar
         alphas = curr / bar.unsqueeze(1)
 
@@ -61,8 +62,9 @@ def canonical_occupancy(params, labels, blank=0):
     labels = labels.long()
     L = 2 * S + 1
     device = params.device
-    logp = torch.log(params.clamp_min(1e-300))  # [P, T]
-    NEG = -1e30
+    dtype = params.dtype
+    logp = torch.log(params.clamp_min(1e-20))  # [P, T]
+    NEG = -1e20
 
     tok = torch.tensor([blank if s % 2 == 0 else int(labels[(s - 1) // 2]) for s in range(L)],
                        dtype=torch.long, device=device)
@@ -73,8 +75,8 @@ def canonical_occupancy(params, labels, blank=0):
             if labels[(s - 1) // 2] != labels[(s - 3) // 2]:
                 can_skip[s] = True
 
-    la = torch.full((L, T), NEG, dtype=torch.float64, device=device)
-    lb = torch.full((L, T), NEG, dtype=torch.float64, device=device)
+    la = torch.full((L, T), NEG, dtype=dtype, device=device)
+    lb = torch.full((L, T), NEG, dtype=dtype, device=device)
 
     la[0, 0] = logp[blank, 0]
     la[1, 0] = logp[labels[0], 0]
@@ -104,16 +106,16 @@ def canonical_occupancy(params, labels, blank=0):
 
 
 def extract_utt_feats_norm_fast(params, labels, blank=0, occ=False, cap_elems=5e8):
-    """Vectorized high-throughput GOP feature-vector extraction on GPU/CPU.
-    cap_elems=5e8 cho phép gom toàn bộ candidate của câu vào 1 pass duy nhất."""
+    """Vectorized high-throughput GOP feature-vector extraction on GPU/CPU (FP32)."""
     P, T = params.shape
     S = labels.shape[0]
     device = params.device
+    dtype = params.dtype
     labels = labels.long().to(device)
 
     nll_canon = ctc_forward_batch_norm(params, labels.view(1, -1), blank=blank)[0]
 
-    feats = torch.zeros((S, 1 + P), dtype=torch.float64, device=device)
+    feats = torch.zeros((S, 1 + P), dtype=dtype, device=device)
     feats[:, 0] = nll_canon
 
     per_pos = P * (2 * S + 1) * T

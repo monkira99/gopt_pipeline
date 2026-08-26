@@ -286,7 +286,7 @@ def extract_split_features(split_name, ds_split, out_path,
                 # 3A. GOP Dynamic Programming
                 sync_cuda(device)
                 t_g0 = time.time()
-                post = torch.softmax(koel_logits.float(), dim=-1).type(torch.float64).T
+                post = torch.softmax(koel_logits.float(), dim=-1).T
                 gop_res, occ_res = extract_utt_feats_norm_fast(post, labels_t, blank=blank_id, occ=False)
                 feat[i, :S] = gop_res.numpy()[:S]
                 if occ_res is not None:
@@ -295,7 +295,7 @@ def extract_split_features(split_name, ds_split, out_path,
                 prof["gop_dp"] += (time.time() - t_g0)
                 # 3B. Single-pass Viterbi Alignment & Prosody
                 t_a0 = time.time()
-                logp = koel_logits.float().log_softmax(-1).cpu().double()
+                logp = koel_logits.float().log_softmax(-1).cpu().float()
                 labels_cpu = labels_t.cpu()
                 segs, T_ctc, _ = phone_segments(logp, labels_cpu, blank=blank_id)
 
