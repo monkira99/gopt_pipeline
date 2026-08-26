@@ -5,9 +5,11 @@
 experiment_name: "stage2_baseline_wavlm32"
 
 dataset:
-  train: "data/gopt_vh_scripted_gold/train.npz"
-  test: "data/gopt_vh_scripted_gold/test_unseen_speakers.npz"
-  val: "data/gopt_vh_scripted_gold/val.npz"
+  hf_dataset: "tiennguyenbnbk/gopt-vh-gold-features"   # đọc thẳng từ HF (feat/prosody/wavlm)
+  train: "train"
+  val: "val"                                            # chọn best checkpoint trên VAL
+  test: "test_unseen_speakers"                          # test chính
+  test2: "test_unseen_prompts"                          # test phụ (báo cáo thêm)
   scale: "0-100"
 
 features:
@@ -39,6 +41,8 @@ training:
   w_word: 1.0
   w_utt: 1.0
   best_metric: "mean"
+  early_stop_patience: 12    # dừng nếu val mean-PCC không cải thiện 12 epoch
+  early_stop_threshold: 0.0
   seed: 0
 
 logging:
@@ -46,3 +50,5 @@ logging:
   wandb_project: "gopt-vh-experiments"
   wandb_run: "stage2-baseline-wavlm32"
   no_wandb: false
+  push_model: true
+  hf_repo: "tiennguyenbnbk/gopt-vh-baseline-wavlm32"

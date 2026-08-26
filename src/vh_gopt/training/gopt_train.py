@@ -145,7 +145,9 @@ class GOPTDataset(Dataset):
                  pros_mean=None, pros_std=None,
                  use_wavlm=False, wavlm_dim=128, wavlm_pca=None,
                  wavlm_norm=None):
-        z = np.load(path, allow_pickle=True)
+        # `path` may be an npz filepath OR a preloaded dict-of-arrays (e.g. built from
+        # a HuggingFace dataset split). Both support z["k"], z.get("k"), "k" in z.
+        z = path if isinstance(path, dict) else np.load(path, allow_pickle=True)
         is_scale_100 = str(z.get("scale", "")) == "0-100"
         self.feat = torch.tensor(z["feat"], dtype=torch.float32)
         self.gop_dim = self.feat.shape[-1]
@@ -178,6 +180,7 @@ class GOPTDataset(Dataset):
         if feat_mean is None:
             fv = self.feat[valid]                                                      # [n_valid,41]
             feat_mean, feat_std = float(fv.mean()), max(float(fv.std()), 1e-6)
+        self.feat_mean, self.feat_std = feat_mean, feat_std
         self.feat = ((self.feat - feat_mean) / feat_std) * vmask
 
         # occupancy as 42nd dim, normalized with its OWN scalar (different scale from LPP/LPR)
@@ -249,6 +252,27 @@ class GOPTDataset(Dataset):
                 "word_label": self.word_label[i], "utt_label": self.utt_label[i]}
 
 
+def hf_split_to_npz_dict(hf_ds, use_wavlm=False, use_prosody=False):
+    """Convert a HuggingFace dataset split into the dict-of-numpy layout GOPTDataset
+    reads (same keys as the extract .npz). Only pulls heavy arrays actually needed."""
+    cols = hf_ds.column_names
+    nd = hf_ds.with_format("numpy")
+    want = ["feat", "phn", "phone_label", "word_id", "word_acc", "utt_label",
+            "phone_weight", "word_weight", "n_vendors", "utt_weight", "utt_nv",
+            "msdd_type", "msdd_sub", "occ"]
+    if use_prosody:
+        want += ["dur", "eng"]
+    if use_wavlm:
+        want += ["wavlm"]
+    out = {k: np.asarray(nd[k]) for k in want if k in cols}
+    row0 = hf_ds[0]                                              # per-row-constant metadata
+    out["phone_list"] = np.array(row0.get("phone_list") or [], dtype="U8")
+    out["scale"] = np.array(str(row0.get("scale", "0-100")))
+    if "wavlm_layer" in cols:
+        out["wavlm_layer"] = np.int64(row0.get("wavlm_layer", 12))
+    return out
+
+
 def collate(batch):
     return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
 
@@ -318,6 +342,12 @@ def main():
     ap.add_argument("--config", default=pre_args.config, help="Path to YAML/JSON experiment config")
     ap.add_argument("--train", default=cfg.get("train", "data/gopt_vh_scripted_gold/train.npz"))
     ap.add_argument("--test", default=cfg.get("test", "data/gopt_vh_scripted_gold/test_unseen_speakers.npz"))
+    ap.add_argument("--val", default=cfg.get("val", None),
+                    help="val split (npz path or split name if --hf-dataset). Best checkpoint selected on this; falls back to test if unset.")
+    ap.add_argument("--test2", default=cfg.get("test2", None),
+                    help="second test split (e.g. test_unseen_prompts) reported at the end.")
+    ap.add_argument("--hf-dataset", default=cfg.get("hf_dataset", None),
+                    help="HF dataset repo (e.g. tiennguyenbnbk/gopt-vh-gold-features); when set, --train/--val/--test/--test2 are treated as SPLIT NAMES.")
     ap.add_argument("--epochs", type=int, default=cfg.get("epochs", 80))
     ap.add_argument("--bs", type=int, default=cfg.get("bs", 25))
     ap.add_argument("--lr", type=float, default=cfg.get("lr", 1e-3))
@@ -354,6 +384,10 @@ def main():
     ap.add_argument("--w-word", type=float, default=cfg.get("w_word", 1.0))
     ap.add_argument("--w-utt", type=float, default=cfg.get("w_utt", 1.0))
     ap.add_argument("--out", default=cfg.get("out", "ckpt/stage2_baseline_wavlm32"))
+    ap.add_argument("--early-stop-patience", type=int, default=cfg.get("early_stop_patience", 0),
+                    help="stop if val metric_for_best_model doesn't improve for N evals (0 = off).")
+    ap.add_argument("--early-stop-threshold", type=float, default=cfg.get("early_stop_threshold", 0.0),
+                    help="min improvement to reset patience.")
     ap.add_argument("--seed", type=int, default=cfg.get("seed", 0))
     ap.add_argument("--wandb-project", default=cfg.get("wandb_project", "gop-ctc-gopt"))
     ap.add_argument("--wandb-run", default=cfg.get("wandb_run", None))
@@ -373,13 +407,41 @@ def main():
 
     assert not (args.use_prosody and args.utt_prosody), "pick one prosody mode"
     load_pros = args.use_prosody or args.utt_prosody
-    tr = GOPTDataset(args.train, use_occ=args.use_occ, use_prosody=load_pros,
+
+    # Resolve data sources: either HF dataset splits (built into dict-of-arrays) or npz paths.
+    if args.hf_dataset:
+        from datasets import load_dataset
+        def _sp(v, default):
+            return default if (not v or v.endswith(".npz") or "/" in v) else v
+        train_split = _sp(args.train, "train")
+        val_split = _sp(args.val, "val")
+        test_split = _sp(args.test, "test_unseen_speakers")
+        test2_split = _sp(args.test2, "test_unseen_prompts")
+        print(f"Nạp HF dataset: {args.hf_dataset}  splits: train={train_split} val={val_split} "
+              f"test={test_split} test2={test2_split}")
+        dd = load_dataset(args.hf_dataset)
+        def _src(split):
+            return hf_split_to_npz_dict(dd[split], use_wavlm=args.use_wavlm, use_prosody=load_pros)
+        train_src, val_src = _src(train_split), (_src(val_split) if val_split in dd else None)
+        test_src = _src(test_split)
+        test2_src = _src(test2_split) if test2_split in dd else None
+    else:
+        train_src, val_src = args.train, (args.val or None)
+        test_src, test2_src = args.test, (args.test2 or None)
+
+    tr = GOPTDataset(train_src, use_occ=args.use_occ, use_prosody=load_pros,
                      use_wavlm=args.use_wavlm, wavlm_dim=args.wavlm_dim)
-    te = GOPTDataset(args.test, feat_mean=tr.feat_mean, feat_std=tr.feat_std,
-                     use_occ=args.use_occ, occ_mean=tr.occ_mean, occ_std=tr.occ_std,
-                     use_prosody=load_pros, pros_mean=tr.pros_mean, pros_std=tr.pros_std,
-                     use_wavlm=args.use_wavlm, wavlm_dim=args.wavlm_dim,
-                     wavlm_pca=tr.wavlm_pca, wavlm_norm=tr.wavlm_norm)  # train stats
+    def _mk(src):                                              # apply TRAIN stats to eval splits
+        return GOPTDataset(src, feat_mean=tr.feat_mean, feat_std=tr.feat_std,
+                           use_occ=args.use_occ, occ_mean=tr.occ_mean, occ_std=tr.occ_std,
+                           use_prosody=load_pros, pros_mean=tr.pros_mean, pros_std=tr.pros_std,
+                           use_wavlm=args.use_wavlm, wavlm_dim=args.wavlm_dim,
+                           wavlm_pca=tr.wavlm_pca, wavlm_norm=tr.wavlm_norm)
+    te = _mk(test_src)
+    va = _mk(val_src) if val_src is not None else te          # select best on val (fallback: test)
+    te2 = _mk(test2_src) if test2_src is not None else None
+    if val_src is None:
+        print("[WARN] no val split -> selecting best checkpoint on TEST (leakage). Pass --val to fix.")
     gop_dim = tr.gop_dim                                            # 41 (./model) hoặc 80 (KoelLabs)
     wavlm_dim = args.wavlm_dim if args.use_wavlm else 0
     enc_dim = gop_dim + (1 if args.use_occ else 0) + wavlm_dim      # encoder feature width
@@ -465,23 +527,47 @@ def main():
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
         optimizers = (opt, sched)
 
-    trainer = Trainer(model=model, args=targs, train_dataset=tr, eval_dataset=te,
-                      data_collator=collate, compute_metrics=compute_metrics, optimizers=optimizers)
+    callbacks = []
+    if args.early_stop_patience and args.early_stop_patience > 0:
+        from transformers import EarlyStoppingCallback
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stop_patience,
+                                               early_stopping_threshold=args.early_stop_threshold))
+        print(f"early stopping: patience={args.early_stop_patience} threshold={args.early_stop_threshold} "
+              f"on val eval_{args.best_metric}")
+    trainer = Trainer(model=model, args=targs, train_dataset=tr, eval_dataset=va,
+                      data_collator=collate, compute_metrics=compute_metrics,
+                      optimizers=optimizers, callbacks=callbacks)
     trainer.train()
 
-    metrics = trainer.evaluate()
     drop = ("eval_loss", "eval_runtime", "eval_samples_per_second", "eval_steps_per_second")
-    best = {k.replace("eval_", ""): v for k, v in metrics.items()
-            if k.startswith("eval_") and k not in drop}
-    print("\nfinal test PCC:", json.dumps({k: round(v, 4) for k, v in best.items()}, ensure_ascii=False))
+    def _eval(ds, prefix):
+        m = trainer.evaluate(ds, metric_key_prefix=prefix)
+        return {k.replace(f"{prefix}_", ""): v for k, v in m.items()
+                if k.startswith(f"{prefix}_") and k not in
+                (f"{prefix}_loss", f"{prefix}_runtime", f"{prefix}_samples_per_second", f"{prefix}_steps_per_second")}
+
+    # best model (selected on VAL) is loaded; report on both held-out test splits
+    val_pcc = _eval(va, "val")
+    best = _eval(te, "test")                       # primary test = test_unseen_speakers
+    all_test = {"test_unseen_speakers": best}
+    print("\nval PCC:", json.dumps({k: round(v, 4) for k, v in val_pcc.items()}, ensure_ascii=False))
+    print("final test (unseen_speakers) PCC:", json.dumps({k: round(v, 4) for k, v in best.items()}, ensure_ascii=False))
+    if te2 is not None:
+        test2 = _eval(te2, "test2")
+        all_test["test_unseen_prompts"] = test2
+        print("final test (unseen_prompts) PCC:", json.dumps({k: round(v, 4) for k, v in test2.items()}, ensure_ascii=False))
 
     os.makedirs(args.out, exist_ok=True)
     trainer.save_model(args.out)
-    _write_config(args, best, tr)
+    _write_config(args, best, tr, val_pcc=val_pcc, all_test=all_test)
     if use_wandb:
         import wandb
         if wandb.run is not None:
-            wandb.summary["best_mean_pcc"] = best.get("mean")
+            wandb.summary["val_mean_pcc"] = val_pcc.get("mean")
+            wandb.summary["test_mean_pcc"] = best.get("mean")
+            for split, d in all_test.items():
+                for k, v in d.items():
+                    wandb.summary[f"{split}/{k}"] = v
             wandb.finish()
 
     if args.push_model:
@@ -491,7 +577,7 @@ def main():
             _push(args.out, args.hf_repo, best)
 
 
-def _write_config(args, best, tr):
+def _write_config(args, best, tr, val_pcc=None, all_test=None):
     wavlm_dim = args.wavlm_dim if args.use_wavlm else 0
     if args.use_wavlm:                                    # lưu PCA + norm cho inference
         mu, comp = tr.wavlm_pca; wm, ws = tr.wavlm_norm
@@ -512,9 +598,12 @@ def _write_config(args, best, tr):
            "phone_list": tr.phone_list,
            "feat_norm": {"mean": tr.feat_mean, "std": tr.feat_std},
            "label_scale": {"phone": 1.0, "word": 5.0, "utt": 5.0, "to_100": 50.0},
+           "hf_dataset": args.hf_dataset,
            "train_cfg": {"sched": args.sched, "balanced": args.balanced,
                          "epochs": args.epochs, "bins": args.bins, "beta": args.beta},
-           "test_pcc": best}
+           "selection": "val" if args.val else "test",
+           "val_pcc": val_pcc, "test_pcc": best,
+           "all_test_pcc": all_test or {"test_unseen_speakers": best}}
     if args.use_occ:
         cfg["occ_norm"] = {"mean": tr.occ_mean, "std": tr.occ_std}
     if args.use_prosody or args.utt_prosody:
@@ -558,7 +647,15 @@ input with `config.feat_norm` before inference.
     api.create_repo(repo, repo_type="model", exist_ok=True, private=True)
     api.upload_folder(folder_path=ckpt_dir, repo_id=repo, repo_type="model",
                       ignore_patterns=["checkpoint-*/**", "runs/**"])
-    print(f"pushed model -> https://huggingface.co/{repo}")
+    # also push the model source ("mã tương ứng") so the checkpoint is self-reloadable
+    import vh_gopt.training as _t
+    src_dir = os.path.dirname(_t.__file__)
+    for fn in ("gopt_model.py", "gopt_hia.py", "gopt_train.py"):
+        fp = os.path.join(src_dir, fn)
+        if os.path.exists(fp):
+            api.upload_file(path_or_fileobj=fp, path_in_repo=f"code/{fn}",
+                            repo_id=repo, repo_type="model")
+    print(f"pushed model + code -> https://huggingface.co/{repo}")
 
 
 if __name__ == "__main__":
