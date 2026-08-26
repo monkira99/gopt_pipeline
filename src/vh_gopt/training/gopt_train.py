@@ -149,6 +149,7 @@ class GOPTDataset(Dataset):
         # a HuggingFace dataset split). Both support z["k"], z.get("k"), "k" in z.
         z = path if isinstance(path, dict) else np.load(path, allow_pickle=True)
         is_scale_100 = str(z.get("scale", "")) == "0-100"
+        self.is_scale_100 = is_scale_100      # nhãn đã ở 0-100? -> quyết định label_scale khi ghi config
         self.feat = torch.tensor(z["feat"], dtype=torch.float32)
         self.gop_dim = self.feat.shape[-1]
         self.phn = torch.tensor(z["phn"].astype(np.int64))
@@ -590,14 +591,18 @@ def _write_config(args, best, tr, val_pcc=None, all_test=None):
            "input_dim": tr.gop_dim + (1 if args.use_occ else 0) + wavlm_dim + (8 if args.use_prosody else 0),
            "embed_dim": args.embed_dim,
            "num_heads": args.heads, "depth": args.depth, "dropout": args.dropout,
-           "max_len": 50, "n_phn_cls": 40, "use_occ": args.use_occ,
+           "max_len": 150, "n_phn_cls": 40, "use_occ": args.use_occ,   # GOPT dùng default max_len=150 (pos-embed); trước ghi nhầm 50
            "use_prosody": args.use_prosody, "utt_prosody": args.utt_prosody,
            "prosody_dim": 8 if args.utt_prosody else 0,
            "use_phono": args.phono, "n_think": args.think, "attn_pool": args.attn_pool,
            "utt_heads": list(UTT_HEADS), "word_heads": list(WORD_HEADS),
            "phone_list": tr.phone_list,
            "feat_norm": {"mean": tr.feat_mean, "std": tr.feat_std},
-           "label_scale": {"phone": 1.0, "word": 5.0, "utt": 5.0, "to_100": 50.0},
+           # nhãn 0-100 -> model xuất thẳng 0-100, KHÔNG nhân (to_100=1.0). Nhãn 0-2 (SO762) -> x50.
+           # Trước đây ghi cứng to_100=50 -> inference nhân đôi -> điểm clip bão hoà 100. (bug đã sửa)
+           "label_scale": ({"phone": 1.0, "word": 1.0, "utt": 1.0, "to_100": 1.0}
+                           if tr.is_scale_100 else
+                           {"phone": 1.0, "word": 5.0, "utt": 5.0, "to_100": 50.0}),
            "hf_dataset": args.hf_dataset,
            "train_cfg": {"sched": args.sched, "balanced": args.balanced,
                          "epochs": args.epochs, "bins": args.bins, "beta": args.beta},
