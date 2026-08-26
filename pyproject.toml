@@ -9,19 +9,33 @@ description = "VuiHoc GOPT/MSDD dataset pipeline (build -> verify -> push Huggin
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
-  "torch",
+  # torch 2.11 = wheel cuối còn build cho CUDA 12.8 (cu128). Bản >=2.12 chỉ có
+  # cu129/cu130 -> đòi driver CUDA >=13, KHÔNG chạy GPU trên pod driver 12.8
+  # (RTX A4500/A4000 community). Ghim 2.11 + ép nguồn cu128 ở [tool.uv.sources].
+  "torch==2.11.0",
   "transformers",
   "soundfile",
   "librosa",
   "tqdm",
   "huggingface_hub",
   "datasets",
-  "torchcodec",
+  "torchcodec==0.11.1",
   "g2p_en",
   "pyyaml",
   "wandb",
   "accelerate>=1.1.0",
 ]
+
+# GPU: kéo torch/torchcodec từ index CUDA 12.8. explicit=true -> chỉ các package
+# khai báo trong [tool.uv.sources] dùng index này, phần còn lại vẫn từ PyPI.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
+torchcodec = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
