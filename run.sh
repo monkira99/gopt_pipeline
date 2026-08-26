@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Dispatcher moi trao cho vh-gopt pipeline.
-#   ./run.sh install                    # pip install -e . (chay 1 lan)
+# Dispatcher for vh-gopt pipeline (UV-native / virtualenv).
+#   ./run.sh install                    # cai dat package editable (uv pip install -e .)
 #   ./run.sh snapshot [flags...]        # (may co du lieu thoi) tao + push corpus snapshot len HF
 #   ./run.sh fetch    [flags...]        # (server build) tai corpus snapshot tu HF
 #   ./run.sh pack     [flags...]        # corpus -> 4 npz (mac dinh trich GOP 80-d; --skip-gop de nhan-only)
@@ -10,27 +10,40 @@
 #   ./run.sh extract  [flags...]        # (server GPU) trich day du Feature: KoelLabs 80-d + Prosody 8-d + WavLM 1024-d -> 4 .npz
 #   ./run.sh train    [flags...]        # train GOPT/HIA tren npz trung gian
 set -euo pipefail
-# Giu cwd cua nguoi goi: cac path tuong doi (data/, cache/) tinh theo noi chay.
-# Uu tien .venv trong thu muc module, roi .venv thu muc cha (layout monorepo); PY=... de override.
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}"
-if [ -z "${PY:-}" ]; then
-  if [ -x "$ROOT/.venv/bin/python" ]; then PY="$ROOT/.venv/bin/python"
-  elif [ -x "$ROOT/../.venv/bin/python" ]; then PY="$ROOT/../.venv/bin/python"
-  else PY="python3"; fi
+
+# Chon runner: Uu tien 'uv run', neu khong co uv thi dung .venv hoac python3
+if [ -n "${PY:-}" ]; then
+  RUNNER=("$PY")
+elif command -v uv >/dev/null 2>&1; then
+  RUNNER=(uv run --project "$ROOT" python)
+elif [ -x "$ROOT/.venv/bin/python" ]; then
+  RUNNER=("$ROOT/.venv/bin/python")
+elif [ -x "$ROOT/../.venv/bin/python" ]; then
+  RUNNER=("$ROOT/../.venv/bin/python")
+else
+  RUNNER=(python3)
 fi
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
-  install) "$PY" -m pip install -e "$ROOT" ;;
-  snapshot) "$PY" -m vh_gopt.dataset.snapshot_corpus "$@" ;;
-  fetch)    "$PY" -m vh_gopt.dataset.fetch_corpus "$@" ;;
-  pack)     "$PY" -m vh_gopt.dataset.pack_stage2 "$@" ;;
-  verify)   "$PY" -m vh_gopt.dataset.verify_dataset "$@" ;;
-  push)     "$PY" -m vh_gopt.dataset.push_dataset "$@" ;;
-  build)    "$PY" -m vh_gopt.dataset.build_gold_arrow "$@" ;;
-  extract)  "$PY" -m vh_gopt.dataset.extract_features "$@" ;;
-  train)    "$PY" -m vh_gopt.training.gopt_train "$@" ;;
+  install)
+    if command -v uv >/dev/null 2>&1; then
+      uv pip install -e "$ROOT"
+    else
+      "${RUNNER[@]}" -m pip install -e "$ROOT"
+    fi
+    ;;
+  snapshot) "${RUNNER[@]}" -m vh_gopt.dataset.snapshot_corpus "$@" ;;
+  fetch)    "${RUNNER[@]}" -m vh_gopt.dataset.fetch_corpus "$@" ;;
+  pack)     "${RUNNER[@]}" -m vh_gopt.dataset.pack_stage2 "$@" ;;
+  verify)   "${RUNNER[@]}" -m vh_gopt.dataset.verify_dataset "$@" ;;
+  push)     "${RUNNER[@]}" -m vh_gopt.dataset.push_dataset "$@" ;;
+  build)    "${RUNNER[@]}" -m vh_gopt.dataset.build_gold_arrow "$@" ;;
+  extract)  "${RUNNER[@]}" -m vh_gopt.dataset.extract_features "$@" ;;
+  train)    "${RUNNER[@]}" -m vh_gopt.training.gopt_train "$@" ;;
   *)
     grep '^#   ' "$0" | sed 's/^# *//'
     exit 1 ;;
