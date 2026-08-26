@@ -102,9 +102,11 @@ class GOPTForScoring(GOPT):
         self.w_phn, self.w_word, self.w_utt, self.noise = w_phn, w_word, w_utt, noise
         self.balanced = balanced
         if balanced:
-            self.register_buffer("bw_edges", torch.tensor(bw_edges))
-            self.register_buffer("bw_phn", torch.tensor(bw_phn))    # for phone & word heads
-            self.register_buffer("bw_utt", torch.tensor(bw_utt))
+            # persistent=False: bảng trọng số chỉ dùng lúc train, KHÔNG lưu vào
+            # state_dict/safetensors (nếu lưu -> inference GOPT báo "Unexpected key bw_*").
+            self.register_buffer("bw_edges", torch.tensor(bw_edges), persistent=False)
+            self.register_buffer("bw_phn", torch.tensor(bw_phn), persistent=False)    # for phone & word heads
+            self.register_buffer("bw_utt", torch.tensor(bw_utt), persistent=False)
 
     def _w(self, label, table):
         idx = torch.bucketize(label.clamp(min=0), self.bw_edges)    # bin index (edges span nhãn thật; bucketize tự đẩy điểm cao vào bin cuối)
