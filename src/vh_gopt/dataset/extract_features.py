@@ -80,12 +80,17 @@ def fast_resample(wav_np, orig_sr, target_sr=16000):
 
 
 class AudioExtractionDataset(Dataset):
-    """CPU Background Producer: Giải mã audio và chuẩn bị mảng nhãn bất đồng bộ."""
-    def __init__(self, ds_split, limit=0, max_len=150):
-        self.ds = ds_split if limit == 0 else ds_split.select(range(min(limit, len(ds_split))))
+    """CPU Background Producer: Giải mã audio và chuẩn bị mảng nhãn bất đồng bộ (Smart Length-Sorted Batching)."""
+    def __init__(self, ds_split, limit=0, max_len=150, sort_by_length=True):
+        raw_ds = ds_split if limit == 0 else ds_split.select(range(min(limit, len(ds_split))))
+        if sort_by_length and "duration_sec" in raw_ds.column_names:
+            durs = np.array(raw_ds["duration_sec"])
+            sorted_idx = np.argsort(durs).tolist()
+            self.ds = raw_ds.select(sorted_idx)
+        else:
+            self.ds = raw_ds
         self.max_len = max_len
         self.phone_list = self.ds[0].get("phone_list") or PHONE_LIST
-
     def __len__(self):
         return len(self.ds)
 
