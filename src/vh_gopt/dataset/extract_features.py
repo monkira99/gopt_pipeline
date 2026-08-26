@@ -496,9 +496,9 @@ def main():
         koel_model = torch.compile(koel_model, mode="reduce-overhead")
     blank_id = detect_blank_id(koel_proc.tokenizer, koel_model)
 
-    # 2. Nạp WavLM Model (Cắt ngắn đúng Layer 12 để loại bỏ 50% tính toán thừa)
-    wl_model, wl_fe = None, None
-    use_wavlm = not args.no_wavlm
+    if args.compile and hasattr(torch, "compile") and args.device.startswith("cuda"):
+        print("   ⚡ Đang kích hoạt torch.compile cho KoelLabs (dynamic=True)...")
+        koel_model = torch.compile(koel_model, dynamic=True)
     if use_wavlm:
         from transformers import AutoFeatureExtractor, WavLMModel
         print(f"\n[2/2] Nạp WavLM SSL Model: {args.wavlm_model} (Layer {args.wavlm_layer}) ...")
@@ -509,8 +509,8 @@ def main():
         if use_fp16:
             wl_model = wl_model.half()
         if args.compile and hasattr(torch, "compile") and args.device.startswith("cuda"):
-            print("   ⚡ Đang kích hoạt torch.compile cho WavLM...")
-            wl_model = torch.compile(wl_model, mode="reduce-overhead")
+            print("   ⚡ Đang kích hoạt torch.compile cho WavLM (dynamic=True)...")
+            wl_model = torch.compile(wl_model, dynamic=True)
 
     # 3. In bảng kiểm tra CUDA Diagnostics
     print_cuda_diagnostics(args.device, koel_model, wl_model, use_fp16, args.compile, args.batch_size, args.num_workers)
