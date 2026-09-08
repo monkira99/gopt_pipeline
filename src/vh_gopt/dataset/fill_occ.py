@@ -135,6 +135,15 @@ def main():
                 occ_by_id[rid] = occ_full.tolist()
             pbar.set_postfix(empty=n_empty)
 
+        # sanity: occ không còn toàn 0
+        arr = np.array(list(occ_by_id.values()), dtype=np.float32)
+        nz = float((arr > 0).mean())
+        print(f"[{sp}] occ computed: utts={len(occ_by_id)} frac_nonzero={nz:.3f} "
+              f"mean_nonzero={arr[arr>0].mean():.3f} max={arr.max():.1f} empty_utt={n_empty}")
+
+        if args.limit:                     # smoke: chỉ tính + báo cáo, không căn/thay cột
+            continue
+
         # Thay cột occ trong split features theo đúng thứ tự id của nó
         f = feats[sp]
         ids = f["id"]
@@ -142,11 +151,6 @@ def main():
         if miss:
             raise SystemExit(f"[{sp}] {len(miss)} id trong features không có ở gold (vd {miss[:3]}) — không thể căn.")
         occ_col = [occ_by_id[str(i)] for i in ids]
-        # sanity: std trên vị trí valid phải > 0 (occ không còn toàn 0)
-        arr = np.array(occ_col, dtype=np.float32)
-        nz = float((arr > 0).mean())
-        print(f"[{sp}] occ filled: rows={len(occ_col)} frac_nonzero={nz:.3f} "
-              f"mean={arr[arr>0].mean():.3f} max={arr.max():.1f} empty_utt={n_empty}")
         if "occ" in f.column_names:
             f = f.remove_columns("occ")
         feats[sp] = f.add_column("occ", occ_col)
