@@ -1,0 +1,60 @@
+# ============================================================================
+# UNIFIED "probe" — tái hiện cấu hình scratchpad đã cho sub_recall 0.638:
+# trunk TO hơn (embed_dim 96, depth 3) + occ + prosody(dur/eng) đưa vào TOKEN phone.
+# Chạy trên v3 (occ đã điền thật). Mục đích: kiểm 0.638 đến từ CAPACITY hay chỉ nhiễu 1-seed.
+# So với base unified.yaml (embed_dim 48/depth 4, utt_prosody, no occ).
+# ============================================================================
+
+experiment_name: "unified_probe"
+
+dataset:
+  hf_dataset: "tiennguyenbnbk/gopt-vh-gold-features-v3"
+  train: "train"
+  val: "val"
+  test: "test_unseen_speakers"
+  test2: "test_unseen_prompts"
+  scale: "0-100"
+
+features:
+  acoustic_model: "KoelLabs/xlsr-english-01"
+  gop_map: "koel"
+  use_occ: true             # occ -> token (v3 có occ thật)
+  use_prosody: true         # dur+eng -> token
+  utt_prosody: false        # loại trừ với use_prosody
+  use_wavlm: true
+  wavlm_dim: 32
+  wavlm_fuse: "stack"
+
+model:
+  arch: "base"
+  embed_dim: 96             # TRUNK TO HƠN (probe)
+  depth: 3
+  heads: 4
+  dropout: 0.20
+  noise: 0.10
+
+training:
+  epochs: 80
+  bs: 25
+  lr: 0.001
+  wd: 0.0001
+  sched: "cosine"
+  w_phn: 1.0
+  w_word: 1.0
+  w_utt: 1.0
+  no_word_head: true
+  w_det: 1.0
+  w_diag: 1.0
+  w_cons: 0.0
+  det_wpow: 0.5
+  best_metric: "unified"
+  early_stop_patience: 12
+  early_stop_threshold: 0.0
+  seed: 0
+
+logging:
+  out: "ckpt/unified_probe"
+  wandb_project: "gopt-vh-experiments"
+  wandb_run: "unified-probe"
+  no_wandb: true
+  push_model: false
