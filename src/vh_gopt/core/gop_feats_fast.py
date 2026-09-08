@@ -232,7 +232,14 @@ def extract_utt_feats_fb(params: torch.Tensor, labels: torch.Tensor, blank: int 
         nll_del = ctc_forward_batch_norm(params, del_mat, blank=blank)
         feats[:, 1 + blank] = (-nll_canon + nll_del).float()
 
-    return feats.cpu(), None
+    # ---------- occupancy (reuse the shared canonical LA/LB, no 2nd fwd-bwd) ----------
+    # gamma[s,t] = exp(LA[s,t] + LB[s,t] - logZ); occ[i] = sum_t gamma[2i+1,t] over the
+    # phone states (odd lattice rows). Identical to canonical_occupancy() but free here.
+    logZ = -nll_canon                                  # = logaddexp(LA[L-1,-1], LA[L-2,-1])
+    gamma = torch.exp(LA + LB - logZ)                  # [L, T] state posteriors
+    occ = gamma[1::2].sum(dim=1)                        # [S] soft occupancy per phone
+
+    return feats.cpu(), occ.float().cpu()
 
 
 def extract_utt_feats_norm_fast(params: torch.Tensor, labels: torch.Tensor, blank: int = 0, occ: bool = False, cap_elems: float = 5e8):
@@ -267,4 +274,55 @@ def extract_utt_feats_norm_fast(params: torch.Tensor, labels: torch.Tensor, blan
         nll_del = ctc_forward_batch_norm(params, del_mat, blank=blank)
         feats[:, 1 + blank] = -nll_canon + nll_del
 
-    return feats.cpu(), None
+    occ_out = canonical_occupancy(params, labels, blank=blank) if occ else None
+    return feats.cpu(), (occ_out.cpu() if occ_out is not None else None)
+
+
+def canonical_occupancy(params: torch.Tensor, labels: torch.Tensor, blank: int = 0) -> torch.Tensor:
+    """Per-phone occupancy = expected #frames a phone state is occupied, via a
+    log-space CTC forward-backward on the CANONICAL sequence (one pass/utt).
+    Returns occ [S] (soft duration; sums ~T over all phones+blanks).
+
+    Ported verbatim from the legacy numpy-era top-level gop_feats_fast so the
+    faster forward-backward extractor stays a strict superset (occ=True support).
+    """
+    P, T = params.shape
+    S = labels.shape[0]
+    labels = labels.long()
+    L = 2 * S + 1
+    logp = torch.log(params.clamp_min(1e-300))            # [P,T]
+    NEG = -1e30
+
+    def tok(s):                                            # token id at CTC state s
+        return blank if s % 2 == 0 else int(labels[(s - 1) // 2])
+
+    la = torch.full((L, T), NEG, dtype=torch.float64)
+    lb = torch.full((L, T), NEG, dtype=torch.float64)
+    la[0, 0] = logp[blank, 0]
+    la[1, 0] = logp[labels[0], 0]
+    for t in range(1, T):
+        for s in range(L):
+            prev = [la[s, t - 1]]
+            if s - 1 >= 0:
+                prev.append(la[s - 1, t - 1])
+            if s % 2 == 1 and s - 2 >= 0 and labels[(s - 1) // 2] != labels[(s - 3) // 2]:
+                prev.append(la[s - 2, t - 1])
+            la[s, t] = torch.logsumexp(torch.stack(prev), 0) + logp[tok(s), t]
+
+    lb[L - 1, T - 1] = 0.0
+    lb[L - 2, T - 1] = 0.0
+    for t in range(T - 2, -1, -1):
+        for s in range(L):
+            nxt = [lb[s, t + 1] + logp[tok(s), t + 1]]
+            if s + 1 < L:
+                nxt.append(lb[s + 1, t + 1] + logp[tok(s + 1), t + 1])
+            if s % 2 == 1 and s + 2 < L and labels[(s - 1) // 2] != labels[(s + 1) // 2]:
+                nxt.append(lb[s + 2, t + 1] + logp[tok(s + 2), t + 1])
+            lb[s, t] = torch.logsumexp(torch.stack(nxt), 0)
+
+    logZ = torch.logsumexp(torch.stack([la[L - 1, T - 1], la[L - 2, T - 1]]), 0)
+    gamma = torch.exp(la + lb - logZ)                     # [L,T] state posteriors
+    occ = torch.zeros(S, dtype=torch.float64)
+    for i in range(S):
+        occ[i] = gamma[2 * i + 1].sum()
+    return occ

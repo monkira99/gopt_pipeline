@@ -202,7 +202,10 @@ class GOPTDataset(Dataset):
             occ = torch.tensor(z["occ"], dtype=torch.float32)                          # [N,50]
             if occ_mean is None:
                 ov = occ[valid]
-                occ_mean, occ_std = float(ov.mean()), float(ov.std())
+                occ_mean, occ_std = float(ov.mean()), max(float(ov.std()), 1e-6)
+                if float(ov.std()) < 1e-6:
+                    print(f"[WARN] occ has ~0 variance ({path}) — occ column empty/constant; "
+                          "use_occ adds a dead feature. Re-extract occupancy or drop --use-occ.")
             self.occ_mean, self.occ_std = occ_mean, occ_std
             occ = (((occ - occ_mean) / occ_std) * valid.float()).unsqueeze(-1)         # [N,50,1]
             self.feat = torch.cat([self.feat, occ], -1)                                # [N,50,42]
