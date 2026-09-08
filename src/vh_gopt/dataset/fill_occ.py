@@ -66,7 +66,11 @@ def main():
     ap.add_argument("--no-fp16", action="store_true")
     ap.add_argument("--public", action="store_true")
     ap.add_argument("--no-push", action="store_true", help="Chỉ tính + báo cáo, không push (kiểm thử)")
+    ap.add_argument("--cache-dir", default="/workspace/occ_cache",
+                    help="Lưu occ đã tính (npz/split) để re-run không phải chạy lại Koel (vd push flaky)")
     args = ap.parse_args()
+
+    os.makedirs(args.cache_dir, exist_ok=True)
 
     use_fp16 = not args.no_fp16 and args.device.startswith("cuda")
     if args.device.startswith("cuda"):
@@ -100,8 +104,17 @@ def main():
         occ_by_id = {}
         n_empty = 0
 
+        cache_fp = os.path.join(args.cache_dir, f"{sp}.npz")
+        if args.limit == 0 and os.path.exists(cache_fp):
+            z = np.load(cache_fp, allow_pickle=True)
+            occ_by_id = {str(i): o for i, o in zip(z["ids"].tolist(), z["occ"].tolist())}
+            print(f"[{sp}] occ nạp từ cache {cache_fp}: {len(occ_by_id)} utts (bỏ qua Koel)")
+
         gv = g.select(range(n))
-        pbar = tqdm(range(0, n, args.batch_size), desc=f"occ {sp}", unit="batch")
+        pbar = tqdm(range(0, n, args.batch_size), desc=f"occ {sp}", unit="batch",
+                    disable=bool(occ_by_id))
+        if occ_by_id:
+            pbar = []  # đã có cache, không chạy Koel
         for start in pbar:
             rows = gv[start:start + args.batch_size]          # dict-of-columns
             B = len(rows["id"])
@@ -143,6 +156,11 @@ def main():
 
         if args.limit:                     # smoke: chỉ tính + báo cáo, không căn/thay cột
             continue
+
+        if not os.path.exists(cache_fp):   # lưu cache để re-run (vd push flaky) khỏi chạy lại Koel
+            ids_c = list(occ_by_id.keys())
+            np.savez(cache_fp, ids=np.array(ids_c),
+                     occ=np.array([occ_by_id[i] for i in ids_c], dtype=np.float32))
 
         # Thay cột occ trong split features theo đúng thứ tự id của nó
         f = feats[sp]
