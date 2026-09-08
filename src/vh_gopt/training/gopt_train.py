@@ -146,7 +146,7 @@ class GOPTDataset(Dataset):
                  occ_mean=None, occ_std=None, use_prosody=False,
                  pros_mean=None, pros_std=None,
                  use_wavlm=False, wavlm_dim=128, wavlm_pca=None,
-                 wavlm_norm=None):
+                 wavlm_norm=None, use_msdd=False):
         # `path` may be an npz filepath OR a preloaded dict-of-arrays (e.g. built from
         # a HuggingFace dataset split). Both support z["k"], z.get("k"), "k" in z.
         z = path if isinstance(path, dict) else np.load(path, allow_pickle=True)
@@ -177,6 +177,15 @@ class GOPTDataset(Dataset):
             self.utt_label = torch.tensor(z["utt"][:, UTT_KEEP], dtype=torch.float32) / 5.0
         self.phone_list = list(z["phone_list"])
         self.use_occ = use_occ
+
+        # MSDD labels (stage-1) — chỉ nạp khi unified trainer yêu cầu. Mặc định tắt nên
+        # stage-2 GOPTDataset không đổi hành vi (getitem không thêm key -> forward scorer nguyên vẹn).
+        self.use_msdd = use_msdd
+        if use_msdd:
+            if "msdd_type" not in z or "msdd_sub" not in z:
+                raise KeyError(f"{path} chưa có msdd_type/msdd_sub; cần dataset v2 (label recipe v2).")
+            self.msdd_type = torch.tensor(z["msdd_type"].astype(np.int64))   # [N,L] 0/1/2, -1=mask
+            self.msdd_sub = torch.tensor(z["msdd_sub"].astype(np.int64))     # [N,L] 0..38, -1=mask
 
         valid = self.phn >= 0                                                          # [N,50]
         vmask = valid.unsqueeze(-1).float()
@@ -251,8 +260,12 @@ class GOPTDataset(Dataset):
         return self.feat.size(0)
 
     def __getitem__(self, i):
-        return {"feat": self.feat[i], "phn": self.phn[i], "phone_label": self.phone_label[i],
+        item = {"feat": self.feat[i], "phn": self.phn[i], "phone_label": self.phone_label[i],
                 "word_label": self.word_label[i], "utt_label": self.utt_label[i]}
+        if self.use_msdd:
+            item["msdd_type"] = self.msdd_type[i]
+            item["msdd_sub"] = self.msdd_sub[i]
+        return item
 
 
 def hf_split_to_npz_dict(hf_ds, use_wavlm=False, use_prosody=False):
@@ -386,6 +399,10 @@ def main():
     ap.add_argument("--w-phn", type=float, default=cfg.get("w_phn", 1.0))
     ap.add_argument("--w-word", type=float, default=cfg.get("w_word", 1.0))
     ap.add_argument("--w-utt", type=float, default=cfg.get("w_utt", 1.0))
+    # E-collapse-1: bỏ head word, word = analytic mean(phone) (docs/ADR_hierarchy_collapse.md).
+    # store_true (KHÔNG dùng BooleanOptionalAction: nó hiểu '--no-word-head' là dạng phủ định -> set False).
+    ap.add_argument("--no-word-head", action="store_true",
+                    default=cfg.get("no_word_head", False))
     ap.add_argument("--out", default=cfg.get("out", "ckpt/stage2_baseline_wavlm32"))
     ap.add_argument("--early-stop-patience", type=int, default=cfg.get("early_stop_patience", 0),
                     help="stop if val metric_for_best_model doesn't improve for N evals (0 = off).")
@@ -395,11 +412,18 @@ def main():
     ap.add_argument("--wandb-project", default=cfg.get("wandb_project", "gop-ctc-gopt"))
     ap.add_argument("--wandb-run", default=cfg.get("wandb_run", None))
     ap.add_argument("--no-wandb", action="store_true", default=cfg.get("no_wandb", False))
-    ap.add_argument("--push-model", action="store_true", default=cfg.get("push_model", False))
+    # store_true + default từ YAML là bẫy: config bật push_model thì CLI KHÔNG tắt
+    # được, và một run smoke test 2 epoch đã ghi đè bản release trên HF.
+    # BooleanOptionalAction cho phép `--no-push-model` phủ quyết config.
+    ap.add_argument("--push-model", action=argparse.BooleanOptionalAction,
+                    default=cfg.get("push_model", False))
     ap.add_argument("--hf-repo", default=cfg.get("hf_repo", None))
     args = ap.parse_args()
     global PHONE_W
     PHONE_W = args.phone_weight
+    if args.no_word_head:
+        args.w_word = 0.0                       # word suy analytic từ phone -> không đóng góp loss
+        print("[E-collapse-1] no_word_head=True -> word=analytic mean(phone), w_word forced 0.0")
 
     from transformers import Trainer, TrainingArguments, set_seed
     set_seed(args.seed)
@@ -480,13 +504,14 @@ def main():
     else:
         jcapt = {}
         if args.phono:
-            from phono import phono_buffer
+            from vh_gopt.core.phono import phono_buffer
             jcapt = dict(use_phono=True, phono_matrix=phono_buffer(tr.phone_list, 40))
         model = GOPTForScoring(input_dim=input_dim, embed_dim=args.embed_dim, num_heads=args.heads,
                                depth=args.depth, dropout=args.dropout, arch=args.arch, noise=args.noise,
                                n_think=args.think, attn_pool=args.attn_pool,
                                utt_prosody=args.utt_prosody, prosody_dim=prosody_dim,
                                wavlm_dim=wavlm_dim, wavlm_fuse=args.wavlm_fuse,
+                               no_word_head=args.no_word_head,
                                w_phn=args.w_phn, w_word=args.w_word, w_utt=args.w_utt, **jcapt, **bw)
         print(f"model=GOPT arch={args.arch} phono={args.phono} think={args.think} "
               f"attn_pool={args.attn_pool} utt_prosody={args.utt_prosody}  "
@@ -598,6 +623,7 @@ def _write_config(args, best, tr, val_pcc=None, all_test=None):
            "use_prosody": args.use_prosody, "utt_prosody": args.utt_prosody,
            "prosody_dim": 8 if args.utt_prosody else 0,
            "use_phono": args.phono, "n_think": args.think, "attn_pool": args.attn_pool,
+           "no_word_head": args.no_word_head,   # word suy analytic mean(phone); checkpoint không có word_head
            "utt_heads": list(UTT_HEADS), "word_heads": list(WORD_HEADS),
            "phone_list": tr.phone_list,
            "feat_norm": {"mean": tr.feat_mean, "std": tr.feat_std},

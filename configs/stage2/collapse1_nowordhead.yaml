@@ -1,0 +1,58 @@
+# ============================================================================
+# E-collapse-1: bỏ head word (word = analytic mean(phone)) — mọi thứ khác = v2_full
+# Kiểm giả thuyết: xóa mục tiêu word (dư thừa) có nâng phone/utt không?
+# Tham chiếu: docs/ADR_hierarchy_collapse.md
+# ============================================================================
+
+experiment_name: "collapse1_nowordhead"
+
+dataset:
+  # v2 repo = nhãn recipe v2-2026-08-27 đã bake sẵn (feature giữ nguyên) ->
+  # train NATIVE qua ./run.sh, KHỎI cần run_v2.py merge. Repo cũ (nhãn stale) còn nguyên.
+  hf_dataset: "tiennguyenbnbk/gopt-vh-gold-features-v2"
+  train: "train"
+  val: "val"
+  test: "test_unseen_speakers"
+  test2: "test_unseen_prompts"
+  scale: "0-100"
+
+features:
+  acoustic_model: "KoelLabs/xlsr-english-01"
+  gop_map: "koel"
+  use_occ: false
+  use_prosody: false
+  utt_prosody: true
+  use_wavlm: true
+  wavlm_dim: 32
+  wavlm_fuse: "stack"
+
+model:
+  model: "gopt"
+  arch: "base"
+  embed_dim: 48
+  depth: 4
+  heads: 4
+  dropout: 0.20
+  noise: 0.10
+
+training:
+  epochs: 80
+  bs: 25
+  lr: 0.001
+  wd: 0.0001
+  sched: "cosine"
+  w_phn: 1.0
+  w_word: 1.0          # bị ép về 0 khi no_word_head (log rõ)
+  w_utt: 1.0
+  no_word_head: true   # <<< lever DUY NHẤT khác v2_full
+  best_metric: "mean"
+  early_stop_patience: 12
+  early_stop_threshold: 0.0
+  seed: 0
+
+logging:
+  out: "ckpt/collapse1_nowordhead"
+  wandb_project: "gopt-vh-experiments"
+  wandb_run: "collapse1-nowordhead"
+  no_wandb: true
+  push_model: false

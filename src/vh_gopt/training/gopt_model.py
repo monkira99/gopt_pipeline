@@ -32,7 +32,8 @@ class GOPT(nn.Module):
                  use_phono=False, phono_matrix=None, n_think=0, attn_pool=False,
                  utt_prosody=False, prosody_dim=0,
                  wavlm_dim=0, wavlm_fuse="stack",
-                 n_utt_head=len(UTT_HEADS), n_word_head=len(WORD_HEADS)):
+                 n_utt_head=len(UTT_HEADS), n_word_head=len(WORD_HEADS),
+                 no_word_head=False):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         assert arch in ("base", "mlp", "concat", "film"), arch
@@ -116,7 +117,12 @@ class GOPT(nn.Module):
 
         self.utt_head = nn.ModuleList([nn.Linear(embed_dim, 1) for _ in range(n_utt_head)])
         self.phn_head = nn.Linear(embed_dim, 1)
-        self.word_head = nn.ModuleList([nn.Linear(embed_dim, 1) for _ in range(n_word_head)])
+        # no_word_head: bỏ hẳn head word (đã chứng minh dư thừa — analytic mean(phone) thắng head,
+        #   xem docs/ADR_hierarchy_collapse.md). Khi bật, word = dự đoán phone broadcast -> _agg_word
+        #   trung bình phone theo word_id = đúng aggregation analytic, 0 tham số word.
+        self.no_word_head = no_word_head
+        self.word_head = None if no_word_head else \
+            nn.ModuleList([nn.Linear(embed_dim, 1) for _ in range(n_word_head)])
 
     def _sym(self, phn_idx):
         oh = F.one_hot(phn_idx, num_classes=self.n_phn_cls).float()
@@ -203,12 +209,17 @@ class GOPT(nn.Module):
             utt = torch.cat([head(cls_out[:, i]) for i, head in enumerate(self.utt_head)], dim=1)
 
         phone = self.phn_head(tok_out).squeeze(-1)                 # [B, L]
-        word = torch.cat([head(tok_out) for head in self.word_head], dim=-1)  # [B, L, n_word_head]
-        return {"utt": utt, "phone": phone, "word": word}
+        if self.word_head is None:                                 # analytic: word = phone (aggregate downstream)
+            word = phone.unsqueeze(-1)                             # [B, L, 1]
+        else:
+            word = torch.cat([head(tok_out) for head in self.word_head], dim=-1)  # [B, L, n_word_head]
+        # `tok` = phone token embeddings [B,L,D] — cho subclass (vd GOPTUnified) gắn head MSDD.
+        # Wrapper *ForScoring bỏ key này trước khi trả (không để lọt vào predictions của Trainer).
+        return {"utt": utt, "phone": phone, "word": word, "tok": tok_out}
 
 
 if __name__ == "__main__":
-    from phono import phono_buffer
+    from vh_gopt.core.phono import phono_buffer
     x = torch.randn(2, 50, 41)
     phn = torch.randint(0, 39, (2, 50)); phn[:, 30:] = -1
     pm = phono_buffer(["AA"] * 39, 40)
