@@ -176,6 +176,14 @@ def main():
     if args.no_push:
         print("--no-push: bỏ qua đẩy HF.")
         return
+    # Ép ONLINE cho bước push, kể cả khi shell còn HF_HUB_OFFLINE=1 (tránh phí compute lại)
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("HF_DATASETS_OFFLINE", None)
+    try:
+        import huggingface_hub.constants as _hc
+        _hc.HF_HUB_OFFLINE = False
+    except Exception:
+        pass
     print(f"Push -> {args.push_repo} (private={not args.public})")
     feats.push_to_hub(args.push_repo, private=not args.public)
     print("XONG.")
