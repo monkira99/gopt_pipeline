@@ -1,0 +1,63 @@
+# ============================================================================
+# UNIFIED: GOPT scorer + MSDD detector trong 1 trunk (src/vh_gopt/training/unified_train.py).
+# Nền = collapse1_nowordhead (config production) + 2 head token (det 3 / diag 39) + loss MSDD.
+# Kết luận thực nghiệm (nhãn v2, fit-val/test-test): merge KHÔNG tụt PCC, MSDD ngang/hơn tách,
+#   coherence "sai âm mà điểm cao" tự đạt sàn nhãn; consistency loss thừa -> w_cons=0.
+# ============================================================================
+
+experiment_name: "unified_perdim"
+
+dataset:
+  hf_dataset: "tiennguyenbnbk/gopt-vh-gold-features-v2"   # cần msdd_type/msdd_sub (recipe v2)
+  train: "train"
+  val: "val"
+  test: "test_unseen_speakers"
+  test2: "test_unseen_prompts"
+  scale: "0-100"
+
+features:
+  acoustic_model: "KoelLabs/xlsr-english-01"
+  gop_map: "koel"
+  use_occ: false
+  feat_norm: "perdim"      # mỗi chiều GOP một mean/std (thay scalar)
+  use_prosody: false
+  utt_prosody: true
+  use_wavlm: true
+  wavlm_dim: 32
+  wavlm_fuse: "stack"
+
+model:
+  arch: "base"
+  embed_dim: 48
+  depth: 4
+  heads: 4
+  dropout: 0.20
+  noise: 0.10
+
+training:
+  epochs: 80
+  bs: 25
+  lr: 0.001
+  wd: 0.0001
+  sched: "cosine"
+  # scorer heads
+  w_phn: 1.0
+  w_word: 1.0          # ép 0 khi no_word_head
+  w_utt: 1.0
+  no_word_head: true
+  # MSDD heads
+  w_det: 1.0
+  w_diag: 1.0
+  w_cons: 0.0          # consistency: đã chứng minh thừa+hại -> tắt
+  det_wpow: 0.5        # sqrt-inverse-freq class weight cho detection
+  best_metric: "unified"   # 0.5*mean_PCC + 0.5*det_f1 (giữ PCC, không bỏ rơi MSDD)
+  early_stop_patience: 12
+  early_stop_threshold: 0.0
+  seed: 0
+
+logging:
+  out: "ckpt/unified_perdim"
+  wandb_project: "gopt-vh-experiments"
+  wandb_run: "unified-v1"
+  no_wandb: true
+  push_model: false

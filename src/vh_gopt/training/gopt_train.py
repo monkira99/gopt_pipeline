@@ -146,7 +146,8 @@ class GOPTDataset(Dataset):
                  occ_mean=None, occ_std=None, use_prosody=False,
                  pros_mean=None, pros_std=None,
                  use_wavlm=False, wavlm_dim=128, wavlm_pca=None,
-                 wavlm_norm=None, use_msdd=False):
+                 wavlm_norm=None, use_msdd=False,
+                 feat_norm="scalar", wavlm_proj="pca"):
         # `path` may be an npz filepath OR a preloaded dict-of-arrays (e.g. built from
         # a HuggingFace dataset split). Both support z["k"], z.get("k"), "k" in z.
         z = path if isinstance(path, dict) else np.load(path, allow_pickle=True)
@@ -191,7 +192,10 @@ class GOPTDataset(Dataset):
         vmask = valid.unsqueeze(-1).float()
         if feat_mean is None:
             fv = self.feat[valid]                                                      # [n_valid,41]
-            feat_mean, feat_std = float(fv.mean()), max(float(fv.std()), 1e-6)
+            if feat_norm == "perdim":       # mỗi chiều GOP một mean/std (cột sub/del về unit-var)
+                feat_mean, feat_std = fv.mean(0), fv.std(0).clamp_min(1e-6)             # [D]
+            else:                            # scalar chung (production, mặc định)
+                feat_mean, feat_std = float(fv.mean()), max(float(fv.std()), 1e-6)
         self.feat_mean, self.feat_std = feat_mean, feat_std
         self.feat = ((self.feat - feat_mean) / feat_std) * vmask
 
@@ -218,15 +222,18 @@ class GOPTDataset(Dataset):
             if "wavlm" not in z:
                 raise KeyError(f"{path} chưa có 'wavlm'; chạy add_wavlm.py trước")
             wl = torch.tensor(z["wavlm"], dtype=torch.float32)                           # [N,50,1024]
-            wv = wl[valid]                                                               # [n_valid,1024]
-            if wavlm_pca is None:                                                        # fit trên train
-                mu = wv.mean(0)
-                U, Sv, Vh = torch.linalg.svd(wv - mu, full_matrices=False)
-                comp = Vh[:wavlm_dim]                                                    # [dim,1024]
-                wavlm_pca = (mu, comp)
-            mu, comp = wavlm_pca
-            self.wavlm_pca = (mu, comp)
-            wl = (wl - mu) @ comp.T                                                      # [N,50,dim]
+            if wavlm_proj == "pca":
+                wv = wl[valid]                                                           # [n_valid,1024]
+                if wavlm_pca is None:                                                    # fit trên train
+                    mu = wv.mean(0)
+                    U, Sv, Vh = torch.linalg.svd(wv - mu, full_matrices=False)
+                    comp = Vh[:wavlm_dim]                                                # [dim,1024]
+                    wavlm_pca = (mu, comp)
+                mu, comp = wavlm_pca
+                self.wavlm_pca = (mu, comp)
+                wl = (wl - mu) @ comp.T                                                  # [N,50,dim]
+            else:                            # "linear": GIỮ 1024 thô, để in_proj học projection end-to-end
+                self.wavlm_pca = None
             wvp = wl[valid]
             if wavlm_norm is None:
                 wavlm_norm = (wvp.mean(0), wvp.std(0).clamp_min(1e-6))
@@ -235,9 +242,11 @@ class GOPTDataset(Dataset):
             self.wavlm_layer = int(z.get("wavlm_layer", 12))
             wl = ((wl - wm) / ws) * valid.unsqueeze(-1).float()
             self.feat = torch.cat([self.feat, wl], -1)                                   # [N,50,+dim]
+            self.wavlm_width = wl.shape[-1]      # dim thực tế nhồi vào stack (wavlm_dim nếu PCA, 1024 nếu linear)
         else:
             self.wavlm_pca = self.wavlm_norm = None
             self.wavlm_layer = None
+            self.wavlm_width = 0
 
         # prosody (3M): duration[1] + energy[7] = 8 dims, each normalized with its OWN scalar
         self.use_prosody = use_prosody

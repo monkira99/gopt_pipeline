@@ -114,6 +114,10 @@ def main():
     ap.add_argument("--use-wavlm", action="store_true", default=cfg.get("use_wavlm", True))
     ap.add_argument("--wavlm-dim", type=int, default=cfg.get("wavlm_dim", 32))
     ap.add_argument("--wavlm-fuse", choices=["stack", "phone", "utt"], default=cfg.get("wavlm_fuse", "stack"))
+    ap.add_argument("--wavlm-proj", choices=["pca", "linear"], default=cfg.get("wavlm_proj", "pca"),
+                    help="pca=SVD-32 cố định (mặc định); linear=giữ WavLM 1024 thô, in_proj học projection end-to-end.")
+    ap.add_argument("--feat-norm", choices=["scalar", "perdim"], default=cfg.get("feat_norm", "scalar"),
+                    help="scalar=1 mean/std cho cả GOP (production); perdim=mỗi chiều GOP một mean/std.")
     ap.add_argument("--noise", type=float, default=cfg.get("noise", 0.10))
     ap.add_argument("--w-phn", type=float, default=cfg.get("w_phn", 1.0))
     ap.add_argument("--w-word", type=float, default=cfg.get("w_word", 1.0))
@@ -164,13 +168,15 @@ def main():
     test2_src = _src(args.test2) if args.test2 in dd else None
 
     tr = GOPTDataset(train_src, use_occ=args.use_occ, use_prosody=load_pros,
-                     use_wavlm=args.use_wavlm, wavlm_dim=args.wavlm_dim, use_msdd=True)
+                     use_wavlm=args.use_wavlm, wavlm_dim=args.wavlm_dim, use_msdd=True,
+                     feat_norm=args.feat_norm, wavlm_proj=args.wavlm_proj)
     def _mk(src):
         return GOPTDataset(src, feat_mean=tr.feat_mean, feat_std=tr.feat_std,
                            use_occ=args.use_occ, occ_mean=tr.occ_mean, occ_std=tr.occ_std,
                            use_prosody=load_pros, pros_mean=tr.pros_mean, pros_std=tr.pros_std,
                            use_wavlm=args.use_wavlm, wavlm_dim=args.wavlm_dim,
-                           wavlm_pca=tr.wavlm_pca, wavlm_norm=tr.wavlm_norm, use_msdd=True)
+                           wavlm_pca=tr.wavlm_pca, wavlm_norm=tr.wavlm_norm, use_msdd=True,
+                           feat_norm=args.feat_norm, wavlm_proj=args.wavlm_proj)
     te = _mk(test_src)
     va = _mk(val_src) if val_src is not None else te
     te2 = _mk(test2_src) if test2_src is not None else None
@@ -178,7 +184,7 @@ def main():
         print("[WARN] không có val -> chọn best trên TEST (leak). Truyền --val để sửa.")
 
     gop_dim = tr.gop_dim
-    wavlm_dim = args.wavlm_dim if args.use_wavlm else 0
+    wavlm_dim = tr.wavlm_width if args.use_wavlm else 0     # width thực (32 nếu PCA, 1024 nếu linear)
     enc_dim = gop_dim + (1 if args.use_occ else 0) + wavlm_dim
     input_dim = enc_dim + (8 if args.use_prosody else 0)
     prosody_dim = 8 if args.utt_prosody else 0
@@ -261,10 +267,16 @@ def main():
 
 def _write_config(args, tr, val_m, all_test, score_scale):
     wavlm_dim = args.wavlm_dim if args.use_wavlm else 0
-    if args.use_wavlm:
+    if args.use_wavlm and tr.wavlm_pca is not None:      # linear: không có PCA để lưu (projection nằm trong in_proj)
         mu, comp = tr.wavlm_pca; wm, ws = tr.wavlm_norm
         np.savez(os.path.join(args.out, "wavlm_pca.npz"),
                  mean=mu.numpy(), comp=comp.numpy(), norm_mean=wm.numpy(), norm_std=ws.numpy())
+    elif args.use_wavlm:
+        wm, ws = tr.wavlm_norm
+        np.savez(os.path.join(args.out, "wavlm_norm.npz"), norm_mean=wm.numpy(), norm_std=ws.numpy())
+
+    def _ser(v):                                          # tensor(perdim) -> list; float giữ nguyên
+        return v.tolist() if hasattr(v, "tolist") else v
     cfg = {
         "arch": "GOPTUnified", "arch_variant": args.arch, "gop_dim": tr.gop_dim,
         "use_wavlm": args.use_wavlm, "wavlm_dim": wavlm_dim, "wavlm_fuse": args.wavlm_fuse,
@@ -277,7 +289,8 @@ def _write_config(args, tr, val_m, all_test, score_scale):
         "n_think": args.think, "attn_pool": args.attn_pool, "no_word_head": args.no_word_head,
         "utt_heads": list(UTT_HEADS), "word_heads": list(WORD_HEADS), "phone_list": tr.phone_list,
         "det_classes": ["OK", "Sub", "Del"], "diag_classes": PHONE_NUM,
-        "feat_norm": {"mean": tr.feat_mean, "std": tr.feat_std},
+        "feat_norm": {"mean": _ser(tr.feat_mean), "std": _ser(tr.feat_std), "mode": args.feat_norm},
+        "wavlm_proj": args.wavlm_proj,
         "label_scale": ({"phone": 1.0, "word": 1.0, "utt": 1.0, "to_100": 1.0}
                         if tr.is_scale_100 else {"phone": 1.0, "word": 5.0, "utt": 5.0, "to_100": 50.0}),
         "loss_weights": {"w_phn": args.w_phn, "w_word": args.w_word, "w_utt": args.w_utt,
